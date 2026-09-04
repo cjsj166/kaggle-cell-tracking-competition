@@ -16,6 +16,7 @@ import argparse
 import json
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -24,7 +25,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import zarr
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 import tracksdata as td
@@ -111,7 +113,7 @@ def _evaluate_pair(
 from augmentations import brightness_augment, flip_augment
 
 DEFAULT_AUGMENTATIONS = [brightness_augment, flip_augment]
-from dataspec import WEIGHTS_PATH
+from dataspec import RUNS_PATH, WEIGHTS_PATH
 
 DEFAULT_METHOD = "unet_transformer"
 _POS_EMBED_DIM = 8   # per axis; total = 4 axes × _POS_EMBED_DIM = 32
@@ -152,6 +154,17 @@ class VideoMeta:
     voxel_size: tuple[float, ...] # physical voxel size = scale * downsample
     q_low: float                  # 0.1% quantile for normalization
     q_high: float                 # 99.9% quantile for normalization
+
+
+@dataclass(frozen=True)
+class ValidationLosses:
+    """Losses and lightweight diagnostics computed from validation windows."""
+
+    edge_loss: float
+    det_loss: float
+    loss: float
+    edge_accuracy: float
+    detection_node_recall: float
 
 
 # =============================================================================
@@ -788,8 +801,10 @@ def train_epoch(
     det_neg_weight: float = 0.1,
     max_iters: int | None = None,
     pool_kernel_um: float = 5.0,
-) -> tuple[float, float]:
-    """Train for one epoch, return (avg edge loss, avg detection loss).
+    writer: SummaryWriter | None = None,
+    global_step: int = 0,
+) -> tuple[float, float, int]:
+    """Train for one epoch and log each optimizer step's losses.
 
     When *max_iters* is set, the loader is cycled repeatedly until that many
     iterations have been performed, regardless of dataset size.
@@ -890,6 +905,12 @@ def train_epoch(
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
+        if writer is not None:
+            writer.add_scalar("train/edge_loss", edge_loss.item(), global_step)
+            writer.add_scalar("train/det_loss", det_loss.item(), global_step)
+            writer.add_scalar("train/loss", loss.item(), global_step)
+        global_step += 1
+
         torch.cuda.synchronize()
         t3 = time.perf_counter()
         t_backward += t3 - t2
@@ -912,6 +933,7 @@ def train_epoch(
     return (
         total_edge_loss / max(n_samples, 1),
         total_det_loss / max(n_samples, 1),
+        global_step,
     )
 
 
@@ -920,14 +942,18 @@ def evaluate(
     model: UNetNodeTransformer,
     loader: DataLoader,
     device: torch.device,
+    det_loss_weight: float = 0.1,
+    det_neg_weight: float = 0.1,
     pool_kernel_um: float = 5.0,
-) -> tuple[float, float, float]:
+) -> ValidationLosses:
     """Evaluate model using detect→match→predict (same path as training).
 
-    Returns (avg_loss, accuracy, node_recall).
+    Returns all three validation losses (edge, detection, combined), plus the
+    inexpensive window-level edge accuracy and detection recall diagnostics.
     """
     model.eval()
-    total_loss, correct, total, n_pairs = 0.0, 0, 0, 0
+    total_edge_loss, total_det_loss = 0.0, 0.0
+    correct, total, n_pairs, n_samples = 0, 0, 0, 0
     gt_matched, gt_total = 0, 0
 
     for batch in loader:
@@ -942,6 +968,15 @@ def evaluate(
 
         B, W = imgs.shape[:2]
         unet_out, det_logits = model.encode(imgs)
+        det_loss = sum(
+            compute_detection_loss(
+                det_logits[i], coords[:, i], masks[:, i], det_neg_weight,
+            )
+            for i in range(W)
+        ) / W
+        total_det_loss += det_loss.item() * B
+        n_samples += B
+
         frame_det: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor,
                               list[torch.Tensor], torch.Tensor]] = []
         for i in range(W):
@@ -985,13 +1020,164 @@ def evaluate(
                 pair_loss, pair_correct, pair_total = _evaluate_pair(
                     pair_logits[b, :ns_b, :nt_b], pair_target[b, :ns_b, :nt_b],
                 )
-                total_loss += pair_loss
+                total_edge_loss += pair_loss
                 correct += pair_correct
                 total += pair_total
                 n_pairs += 1
 
-    node_recall = gt_matched / max(gt_total, 1)
-    return total_loss / max(n_pairs, 1), correct / max(total, 1), node_recall
+    edge_loss = total_edge_loss / max(n_pairs, 1)
+    det_loss = total_det_loss / max(n_samples, 1)
+    return ValidationLosses(
+        edge_loss=edge_loss,
+        det_loss=det_loss,
+        loss=edge_loss + det_loss_weight * det_loss,
+        edge_accuracy=correct / max(total, 1),
+        detection_node_recall=gt_matched / max(gt_total, 1),
+    )
+
+
+@torch.no_grad()
+def evaluate_tracking_metrics(
+    model: UNetNodeTransformer,
+    dataset_paths: list[Path],
+    device: torch.device,
+    window_size: int,
+    downsample: tuple[int, ...],
+    pool_kernel_um: float,
+    max_frames: int | None = None,
+) -> dict[str, float]:
+    """Run full-video validation and aggregate every competition metric."""
+    from evaluate import _read_estimated_n_total
+    from predict_unet_transformer import PredictConfig, build_graph, predict_video
+    from tracking_cellmot.metrics import (
+        ADJUSTMENT_ALPHA,
+        COUNT_COLUMNS,
+        evaluate as compute_tracking_metric,
+        node_recall,
+        per_sample_metrics,
+        summarise,
+    )
+
+    predict_config = PredictConfig(
+        det_threshold=0.5,
+        det_tta=False,
+        pool_kernel_um=pool_kernel_um,
+        edge_activation="softmax",
+        threshold=0.5,
+        max_parents_per_node=1,
+        max_children_per_node=2,
+    )
+    rows: list[dict] = []
+
+    for dataset_path in dataset_paths:
+        coords, edges = predict_video(
+            model,
+            dataset_path,
+            device,
+            cfg=predict_config,
+            window_size=window_size,
+            max_frames=max_frames,
+            downsample=downsample,
+        )
+        pred_graph = build_graph(coords, edges)
+        dataset = open_dataset(dataset_path, require_tracks=True, load_image=False)
+        gt_graph = dataset.tracks
+        assert gt_graph is not None
+        assert dataset.image_shape is not None
+
+        n_total = _read_estimated_n_total(dataset_path.with_suffix(".geff"))
+        if max_frames is not None:
+            frame_count = min(max_frames, dataset.image_shape[0])
+            gt_graph = gt_graph.filter(td.NodeAttr("t") < frame_count).subgraph()
+            if n_total == n_total:
+                n_total *= frame_count / dataset.image_shape[0]
+
+        result = compute_tracking_metric(pred_graph, gt_graph, scale=dataset.scale)
+        recall = (
+            node_recall(pred_graph, gt_graph)
+            if pred_graph.num_nodes() > 0 and pred_graph.num_edges() > 0
+            else 0.0
+        )
+        row = per_sample_metrics(result, n_total, recall)
+        row["estimated_num_nodes"] = n_total
+        rows.append(row)
+
+    summary = summarise(rows)
+    valid_rows = [row for row in rows if row["edge_tp"] == row["edge_tp"]]
+    totals = {
+        name: float(sum(row[name] for row in valid_rows))
+        for name in COUNT_COLUMNS
+    }
+    estimated_rows = [
+        row for row in valid_rows
+        if row["estimated_num_nodes"] == row["estimated_num_nodes"]
+    ]
+    estimated_num_nodes = sum(row["estimated_num_nodes"] for row in estimated_rows)
+    estimated_pred_nodes = sum(row["num_pred_nodes"] for row in estimated_rows)
+    if estimated_num_nodes > 0:
+        total_node_ratio = (
+            estimated_pred_nodes - estimated_num_nodes
+        ) / estimated_num_nodes
+        node_count_adjustment = max(
+            0.0, 1.0 - ADJUSTMENT_ALPHA * total_node_ratio,
+        )
+        over_detection_penalty = min(
+            1.0, max(0.0, ADJUSTMENT_ALPHA * total_node_ratio),
+        )
+    else:
+        total_node_ratio = float("nan")
+        node_count_adjustment = float("nan")
+        over_detection_penalty = float("nan")
+
+    return {
+        **{name: float(value) for name, value in summary.items()},
+        **totals,
+        "estimated_num_nodes": float(estimated_num_nodes),
+        "total_node_ratio": total_node_ratio,
+        "node_count_adjustment": node_count_adjustment,
+        "over_detection_penalty": over_detection_penalty,
+    }
+
+
+def log_validation_to_tensorboard(
+    writer: SummaryWriter,
+    losses: ValidationLosses,
+    metrics: dict[str, float],
+    epoch: int,
+) -> None:
+    """Write all validation losses and tracking metrics for one epoch."""
+    writer.add_scalar("validation/edge_loss", losses.edge_loss, epoch)
+    writer.add_scalar("validation/det_loss", losses.det_loss, epoch)
+    writer.add_scalar("validation/loss", losses.loss, epoch)
+    writer.add_scalar("validation/edge_accuracy", losses.edge_accuracy, epoch)
+    writer.add_scalar(
+        "validation/detection_node_recall",
+        losses.detection_node_recall,
+        epoch,
+    )
+    for name, value in metrics.items():
+        writer.add_scalar(f"validation/{name}", value, epoch)
+
+
+def _canonical_model_state(model: UNetNodeTransformer) -> dict[str, torch.Tensor]:
+    """Return a state dict that loads without a DataParallel wrapper."""
+    return {
+        key.replace("unet.module.", "unet.", 1): value
+        for key, value in model.state_dict().items()
+    }
+
+
+def _load_model_state(
+    model: UNetNodeTransformer,
+    state: dict[str, torch.Tensor],
+) -> None:
+    """Load a canonical state dict into a single- or multi-GPU model."""
+    if isinstance(model.unet, nn.DataParallel):
+        state = {
+            (key.replace("unet.", "unet.module.", 1) if key.startswith("unet.") else key): value
+            for key, value in state.items()
+        }
+    model.load_state_dict(state)
 
 
 # =============================================================================
@@ -1021,6 +1207,7 @@ def train(
     augmentations: list | None = DEFAULT_AUGMENTATIONS,
     pool_kernel_um: float = 5.0,
     data_parallel: bool = True,
+    resume: Path | None = None,
 ) -> UNetNodeTransformer:
     """Train on one fold from a pre-computed splits file.
 
@@ -1158,55 +1345,121 @@ def train(
     print(f"Model parameters: {n_params:,}", flush=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    print(f"Starting training for {n_epochs} epochs (batch_size={batch_size})...", flush=True)
-
+    start_epoch = 0
+    global_step = 0
     best_score = 0.0
     save_path = output_dir / "edge_predictor_best.pth"
-    pbar = tqdm(range(n_epochs), desc="Training", disable=False)
-    print(f"Detection loss: weight={det_loss_weight}, neg_weight={det_neg_weight}", flush=True)
+    checkpoint_dir = output_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = RUNS_PATH / method / f"split_{fold}" / datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    for epoch in pbar:
-        t0 = time.monotonic()
-        edge_loss, det_loss = train_epoch(
-            model, train_loader, optimizer, device, det_loss_weight, det_neg_weight,
-            max_iters=max_iters, pool_kernel_um=pool_kernel_um,
-        )
-        train_time = time.monotonic() - t0
-
-        t0 = time.monotonic()
-        test_loss, test_acc, test_recall = evaluate(model, test_loader, device, pool_kernel_um=pool_kernel_um)
-        test_time = time.monotonic() - t0
-
-        score = test_acc * test_recall
-        is_best = score >= best_score
-
-        if is_best:
-            best_score = score
-            # Normalise any DataParallel "unet.module." prefix to "unet." so the
-            # checkpoint loads on a single GPU (e.g. in the prediction script).
-            torch.save(
-                {k.replace("unet.module.", "unet.", 1): v for k, v in model.state_dict().items()},
-                save_path,
-            )
-
-        marker = "*" if is_best else " "
-        pbar.set_postfix(edge=f"{edge_loss:.4f}", det=f"{det_loss:.4f}", acc=f"{test_acc:.4f}")
+    if resume is not None:
+        checkpoint = torch.load(resume, map_location=device, weights_only=True)
+        if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
+            raise ValueError(f"Not a training checkpoint: {resume}")
+        _load_model_state(model, checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_epoch = int(checkpoint["epoch"])
+        global_step = int(checkpoint.get("global_step", 0))
         print(
-            f"  Epoch {epoch:3d}/{n_epochs} | edge={edge_loss:.4f} | det={det_loss:.4f} | "
-            f"test_loss={test_loss:.4f} | acc={test_acc:.4f} | recall={test_recall:.4f} | best={best_score:.4f} {marker} | "
-            f"train={train_time:.1f}s test={test_time:.1f}s",
+            f"Resumed {resume}: completed_epochs={start_epoch}, "
+            f"global_step={global_step}",
             flush=True,
         )
+
+    print(
+        f"Starting training at epoch {start_epoch + 1} of {n_epochs} "
+        f"(batch_size={batch_size})...",
+        flush=True,
+    )
+    writer = SummaryWriter(log_dir=str(run_dir))
+    print(f"TensorBoard logs: {run_dir}", flush=True)
+    pbar = tqdm(range(start_epoch, n_epochs), desc="Training", disable=False)
+    print(f"Detection loss: weight={det_loss_weight}, neg_weight={det_neg_weight}", flush=True)
+
+    try:
+        for epoch in pbar:
+            t0 = time.monotonic()
+            edge_loss, det_loss, global_step = train_epoch(
+                model, train_loader, optimizer, device, det_loss_weight, det_neg_weight,
+                max_iters=max_iters, pool_kernel_um=pool_kernel_um,
+                writer=writer, global_step=global_step,
+            )
+            train_time = time.monotonic() - t0
+
+            t0 = time.monotonic()
+            validation_losses = evaluate(
+                model,
+                test_loader,
+                device,
+                det_loss_weight=det_loss_weight,
+                det_neg_weight=det_neg_weight,
+                pool_kernel_um=pool_kernel_um,
+            )
+            validation_metrics = evaluate_tracking_metrics(
+                model,
+                test_files,
+                device,
+                window_size=window_size,
+                downsample=downsample,
+                pool_kernel_um=pool_kernel_um,
+                max_frames=max_frames,
+            )
+            validation_time = time.monotonic() - t0
+
+            score = (
+                validation_losses.edge_accuracy
+                * validation_losses.detection_node_recall
+            )
+            is_best = score >= best_score
+            model_state = _canonical_model_state(model)
+
+            if is_best:
+                best_score = score
+                torch.save(model_state, save_path)
+
+            epoch_number = epoch + 1
+            checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch_number:04d}.pth"
+            torch.save(
+                {
+                    "format_version": 1,
+                    "epoch": epoch_number,
+                    "global_step": global_step,
+                    "model_state_dict": model_state,
+                    "optimizer_state_dict": optimizer.state_dict(),
+                },
+                checkpoint_path,
+            )
+            log_validation_to_tensorboard(
+                writer, validation_losses, validation_metrics, epoch_number,
+            )
+            writer.flush()
+
+            marker = "*" if is_best else " "
+            pbar.set_postfix(
+                edge=f"{edge_loss:.4f}",
+                det=f"{det_loss:.4f}",
+                val_score=f"{validation_metrics['score']:.4f}",
+            )
+            print(
+                f"  Epoch {epoch_number:3d}/{n_epochs} | edge={edge_loss:.4f} | det={det_loss:.4f} | "
+                f"val_loss={validation_losses.loss:.4f} | "
+                f"edge_jaccard={validation_metrics['edge_jaccard']:.4f} | "
+                f"adj_edge_jaccard={validation_metrics['adj_edge_jaccard']:.4f} | "
+                f"division_jaccard={validation_metrics['division_jaccard']:.4f} | "
+                f"over_detection_penalty={validation_metrics['over_detection_penalty']:.4f} | "
+                f"best={best_score:.4f} {marker} | train={train_time:.1f}s "
+                f"validation={validation_time:.1f}s | "
+                f"checkpoint={checkpoint_path}",
+                flush=True,
+            )
+    finally:
+        writer.close()
 
     print(f"\nBest score (acc*recall): {best_score:.4f}, saved to {save_path}", flush=True)
     if save_path.exists():
         state = torch.load(save_path, map_location=device, weights_only=True)
-        if isinstance(model.unet, nn.DataParallel):
-            state = {
-                (k.replace("unet.", "unet.module.", 1) if k.startswith("unet.") else k): v
-                for k, v in state.items()
-            }
-        model.load_state_dict(state)
+        _load_model_state(model, state)
     return model
 
 
@@ -1252,6 +1505,8 @@ def main() -> None:
                              "when more than one is available (default: on).")
     parser.add_argument("--single-gpu", dest="data_parallel", action="store_false",
                         help="Disable multi-GPU; train on cuda:0 only.")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Resume from an epoch checkpoint. --epochs remains the total target epoch count.")
 
     args = parser.parse_args()
 
@@ -1261,11 +1516,16 @@ def main() -> None:
     unet_layers = [int(x) for x in args.unet_layers.split(",")]
     unet_weights = Path(args.unet_weights) if args.unet_weights else None
     debug_video = Path(args.debug_video) if args.debug_video else None
+    resume = Path(args.resume) if args.resume else None
     downsample = tuple(int(x) for x in args.downsample.split(","))
 
     folds = [0] if debug_video is not None else (
         range(5) if args.split == "all" else [int(args.split)]
     )
+    if resume is not None and args.split == "all":
+        parser.error("--resume requires a single --split; it cannot be used with --split all")
+    if resume is not None and unet_weights is not None:
+        parser.error("--resume and --unet-weights cannot be used together")
     for fold in folds:
         train(
             data_dir=data_dir,
@@ -1287,6 +1547,7 @@ def main() -> None:
             window_size=args.window_size,
             pool_kernel_um=args.pool_kernel_um,
             data_parallel=args.data_parallel,
+            resume=resume,
         )
 
 

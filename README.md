@@ -37,6 +37,25 @@ uv run python scripts/train_unet_transformer.py \
     --data-dir data/train --split 0 --epochs 3
 ```
 
+Training losses are written to `runs/<method>/split_<fold>/<run-id>/` for
+TensorBoard. Every validation epoch also records edge, detection, and combined
+losses together with the full tracking score breakdown: adjusted and raw edge
+Jaccard, division Jaccard, node recall, TP/FP/FN counts, predicted/estimated
+node counts, and the over-detection penalty. A full training checkpoint is
+saved after every epoch under
+`weights/<method>/split_<fold>/checkpoints/`. Resume from one while keeping
+`--epochs` as the total target epoch count:
+
+```bash
+uv run python scripts/train_unet_transformer.py \
+    --data-dir data/train --split 0 --epochs 50 \
+    --resume weights/unet_transformer/split_0/checkpoints/checkpoint_epoch_0010.pth
+```
+
+```bash
+uv run tensorboard --logdir runs
+```
+
 This command trained the model released in the public [UNet baseline inference notebook](https://www.kaggle.com/code/thibautgoldsborough/unet-baseline-inference-submission). It was not trained to convergence — expect gains from training longer.
 
 ### Prediction

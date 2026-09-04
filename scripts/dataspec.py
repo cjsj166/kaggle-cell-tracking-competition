@@ -39,3 +39,4 @@ DATASET_PATH = _default_dataset_path()
 PREDICTIONS_PATH = _BASE / "predictions"
 RESULTS_PATH = _BASE / "results"
 WEIGHTS_PATH = _BASE / "weights"
+RUNS_PATH = _BASE / "runs"
