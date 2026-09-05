@@ -385,6 +385,11 @@ def load_dataset_windows(
     tuple[VideoMeta, list[FrameWindowData]]
         Lightweight video metadata and per-window node data.  No image tensor.
     """
+    if window_size < 2:
+        raise ValueError("window_size must be at least 2")
+    if max_frames is not None and max_frames < window_size:
+        raise ValueError("max_frames must be at least window_size")
+
     ds = open_dataset(ds_path, normalize=False, require_tracks=True,
                       load_image=False, downsample=downsample)
     if "0.001" not in ds.quantiles or "0.999" not in ds.quantiles:
@@ -398,7 +403,7 @@ def load_dataset_windows(
         tracks = invert_time_graph(tracks, max_t=image_shape[0])
 
     if max_frames is not None:
-        image_shape = (max_frames, *image_shape[1:])
+        image_shape = (min(max_frames, image_shape[0]), *image_shape[1:])
         tracks = tracks.filter(td.NodeAttr("t") < max_frames).subgraph()
 
     video_meta = VideoMeta(
@@ -1197,12 +1202,20 @@ def train(
     pool_kernel_um: float = 5.0,
     data_parallel: bool = True,
     resume: Path | None = None,
+    max_datasets: int | None = None,
 ) -> UNetNodeTransformer:
     """Train on one fold from a pre-computed splits file.
 
     If *debug_video* is set the splits file is ignored and that single dataset
     is used for both train and test (quick sanity-check / overfitting run).
     """
+    if max_datasets is not None and max_datasets < 1:
+        raise ValueError("max_datasets must be positive")
+    if window_size < 2:
+        raise ValueError("window_size must be at least 2")
+    if max_frames is not None and max_frames < window_size:
+        raise ValueError("max_frames must be at least window_size")
+
     if unet_layers is None:
         unet_layers = [32, 64, 128]
 
@@ -1230,6 +1243,10 @@ def train(
         train_files = [data_dir / name for name in fold_data["train"]]
         test_files = [data_dir / name for name in fold_data["test"]]
         print(f"Fold {fold}: {len(train_files)} train, {len(test_files)} test")
+
+    if max_datasets is not None:
+        train_files = train_files[:max_datasets]
+        test_files = test_files[:max_datasets]
 
     output_dir = WEIGHTS_PATH / method / f"split_{fold}"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1262,6 +1279,13 @@ def train(
 
     train_video_data = _load(train_files, "train")
     test_video_data = _load(test_files, "test")
+
+    for name, data in (("train", train_video_data), ("validation", test_video_data)):
+        if not any(windows for _, windows in data):
+            raise ValueError(
+                f"No usable {name} windows; increase max_frames/max_datasets "
+                "or check the split and annotations."
+            )
 
     # Compute consistent max_nodes across train + test.
     all_windows = [w for _, ws in train_video_data + test_video_data for w in ws]
@@ -1486,6 +1510,10 @@ def main() -> None:
                         help="Per-voxel weight for non-GT (negative) voxels in detection loss (default: 1e-2).")
     parser.add_argument("--max-iters", type=int, default=None,
                         help="Max training iterations per epoch. None = full epoch.")
+    parser.add_argument("--max-datasets", type=int, default=None,
+                        help="Load only the first N datasets of each train/validation split.")
+    parser.add_argument("--max-frames", type=int, default=None,
+                        help="Use only the first N frames per video for training and validation.")
     parser.add_argument("--debug-video", type=str, default=None,
                         help="Path to a single dataset for quick debugging. "
                              "Ignores --fold and splits file; trains and evaluates on this video only.")
@@ -1502,6 +1530,12 @@ def main() -> None:
                         help="Resume from an epoch checkpoint. --epochs remains the total target epoch count.")
 
     args = parser.parse_args()
+    if args.max_datasets is not None and args.max_datasets < 1:
+        parser.error("--max-datasets must be positive")
+    if args.window_size < 2:
+        parser.error("--window-size must be at least 2")
+    if args.max_frames is not None and args.max_frames < args.window_size:
+        parser.error("--max-frames must be at least --window-size")
 
     from dataspec import DATASET_PATH
     data_dir = Path(args.data_dir) if args.data_dir else Path(DATASET_PATH)
@@ -1536,6 +1570,8 @@ def main() -> None:
             det_loss_weight=args.det_loss_weight,
             det_neg_weight=args.det_neg_weight,
             max_iters=args.max_iters,
+            max_datasets=args.max_datasets,
+            max_frames=args.max_frames,
             debug_video=debug_video,
             window_size=args.window_size,
             pool_kernel_um=args.pool_kernel_um,
