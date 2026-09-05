@@ -39,6 +39,25 @@ uv run python scripts/train_unet_transformer.py \
 
 This command trained the model released in the public [UNet baseline inference notebook](https://www.kaggle.com/code/thibautgoldsborough/unet-baseline-inference-submission). It was not trained to convergence — expect gains from training longer.
 
+### Smoke test
+
+Run a short train/validation pass with a separate output directory:
+
+```bash
+bash scripts/smoke_train.sh --data-dir data/train
+```
+
+The preset uses the first video in each split, its first four frames, one
+epoch, two training steps, batch size one, and no DataLoader workers.
+Override defaults by appending options, e.g. `--max-frames 8`.
+`--max-datasets` limits videos before opening their files; `--max-frames`
+limits window preparation, lazy image reads, and validation.
+The selected videos' GEFF graphs are still read in full before filtering.
+Without these options, training uses all videos and frames as before.
+`--max-iters` alone only limits training steps and does not reduce preparation
+or validation. If the selected frames have no annotated windows, increase
+the limits or choose a video with `--debug-video`.
+
 ### Prediction
 
 ```bash
