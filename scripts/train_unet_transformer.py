@@ -381,6 +381,7 @@ def load_dataset_windows(
     ds_path: Path,
     window_size: int = 2,
     invert_time: bool = False,
+    max_frames: int | None = None,
     downsample: tuple[int, ...] = (1, 1, 1),
 ) -> tuple[VideoMeta, list[FrameWindowData]]:
     """Load per-window metadata and video stats for one dataset.
@@ -404,6 +405,10 @@ def load_dataset_windows(
 
     if invert_time:
         tracks = invert_time_graph(tracks, max_t=image_shape[0])
+
+    if max_frames is not None:
+        image_shape = (max_frames, *image_shape[1:])
+        tracks = tracks.filter(td.NodeAttr("t") < max_frames).subgraph()
 
     video_meta = VideoMeta(
         zarr_path=ds.zarr_path,
@@ -1179,6 +1184,7 @@ def train(
     max_iters: int | None = None,
     debug_video: Path | None = None,
     seed: int | None = None,
+    max_frames: int | None = None,
     window_size: int = 2,
     augmentations: list | None = DEFAULT_AUGMENTATIONS,
     pool_kernel_um: float = 5.0,
@@ -1239,6 +1245,7 @@ def train(
         for f in tqdm(files, desc=desc, disable=False):
             video_meta, windows = load_dataset_windows(
                 f, window_size=window_size,
+                max_frames=max_frames,
                 downsample=downsample,
             )
             data.append((video_meta, windows))
