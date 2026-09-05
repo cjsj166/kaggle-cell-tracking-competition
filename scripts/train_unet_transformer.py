@@ -385,7 +385,7 @@ def load_dataset_windows(
         tracks = invert_time_graph(tracks, max_t=image_shape[0])
 
     if max_frames is not None:
-        image_shape = (min(max_frames, image_shape[0]), *image_shape[1:])
+        image_shape = (max_frames, *image_shape[1:])
         tracks = tracks.filter(td.NodeAttr("t") < max_frames).subgraph()
 
     video_meta = VideoMeta(
@@ -1034,8 +1034,6 @@ def train(
         raise ValueError("max_datasets must be positive")
     if window_size < 2:
         raise ValueError("window_size must be at least 2")
-    if max_frames is not None and max_frames < window_size:
-        raise ValueError("max_frames must be at least window_size")
 
     if unet_layers is None:
         unet_layers = [32, 64, 128]
@@ -1104,7 +1102,7 @@ def train(
     for name, data in (("train", train_video_data), ("validation", test_video_data)):
         if not any(windows for _, windows in data):
             raise ValueError(
-                f"No usable {name} windows; increase max_frames/max_datasets "
+                f"No usable {name} windows; increase max_datasets "
                 "or check the split and annotations."
             )
 
@@ -1265,8 +1263,6 @@ def main() -> None:
                              "one full loader pass.")
     parser.add_argument("--max-datasets", type=int, default=None,
                         help="Load only the first N datasets of each train/validation split.")
-    parser.add_argument("--max-frames", type=int, default=None,
-                        help="Use only the first N frames per video for training and validation.")
     parser.add_argument("--debug-video", type=str, default=None,
                         help="Path to a single dataset for quick debugging. "
                              "Ignores --fold and splits file; trains and evaluates on this video only.")
@@ -1285,8 +1281,6 @@ def main() -> None:
         parser.error("--max-datasets must be positive")
     if args.window_size < 2:
         parser.error("--window-size must be at least 2")
-    if args.max_frames is not None and args.max_frames < args.window_size:
-        parser.error("--max-frames must be at least --window-size")
 
     from dataspec import DATASET_PATH
     data_dir = Path(args.data_dir) if args.data_dir else Path(DATASET_PATH)
@@ -1317,7 +1311,6 @@ def main() -> None:
             det_neg_weight=args.det_neg_weight,
             max_iters=args.max_iters,
             max_datasets=args.max_datasets,
-            max_frames=args.max_frames,
             debug_video=debug_video,
             window_size=args.window_size,
             pool_kernel_um=args.pool_kernel_um,
