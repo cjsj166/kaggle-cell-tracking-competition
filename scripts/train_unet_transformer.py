@@ -372,11 +372,6 @@ def load_dataset_windows(
     tuple[VideoMeta, list[FrameWindowData]]
         Lightweight video metadata and per-window node data.  No image tensor.
     """
-    if window_size < 2:
-        raise ValueError("window_size must be at least 2")
-    if max_frames is not None and max_frames < window_size:
-        raise ValueError("max_frames must be at least window_size")
-
     ds = open_dataset(ds_path, normalize=False, require_tracks=True,
                       load_image=False, downsample=downsample)
     if "0.001" not in ds.quantiles or "0.999" not in ds.quantiles:
