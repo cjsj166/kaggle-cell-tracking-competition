@@ -791,8 +791,10 @@ def train_epoch(
 ) -> tuple[float, float]:
     """Train for one epoch, return (avg edge loss, avg detection loss).
 
-    When *max_iters* is set, the loader is cycled repeatedly until that many
-    iterations have been performed, regardless of dataset size.
+    ``max_iters`` is a smoke-test-only override for exercising the training
+    pipeline quickly. When set, the loader is cycled until that many iterations
+    have run; leave it unset for real training, where an epoch is one full
+    loader pass.
     """
     model.train()
     total_edge_loss = 0.0
@@ -1239,7 +1241,9 @@ def main() -> None:
     parser.add_argument("--det-neg-weight", type=float, default=1e-2,
                         help="Per-voxel weight for non-GT (negative) voxels in detection loss (default: 1e-2).")
     parser.add_argument("--max-iters", type=int, default=None,
-                        help="Max training iterations per epoch. None = full epoch.")
+                        help="Smoke-test only: override optimizer steps per epoch, cycling the "
+                             "loader as needed. Leave unset for real training so each epoch is "
+                             "one full loader pass.")
     parser.add_argument("--debug-video", type=str, default=None,
                         help="Path to a single dataset for quick debugging. "
                              "Ignores --fold and splits file; trains and evaluates on this video only.")
