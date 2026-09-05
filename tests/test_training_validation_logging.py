@@ -36,7 +36,10 @@ class _ValidationModel:
         )
 
 
-def test_evaluate_returns_all_three_validation_losses(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("valid_pairs", [0, 1, 2])
+def test_evaluate_returns_all_three_validation_losses(
+    monkeypatch: pytest.MonkeyPatch, valid_pairs: int,
+) -> None:
     batch_size, window_size = 2, 2
     batch = {
         "imgs": torch.zeros(batch_size, window_size, 1, 1, 1),
@@ -63,17 +66,105 @@ def test_evaluate_returns_all_three_validation_losses(monkeypatch: pytest.Monkey
         "compute_detection_loss",
         lambda *args, **kwargs: torch.tensor(2.0),
     )
-    monkeypatch.setattr(training, "_evaluate_pair", lambda *args: (3.0, 1, 2))
+    pair_results = iter([(3.0, 1, 2)] * valid_pairs + [(0.0, 0, 0)] * (batch_size - valid_pairs))
+    monkeypatch.setattr(training, "_evaluate_pair", lambda *args: next(pair_results))
 
     result = training.evaluate(
         _ValidationModel(), [batch], torch.device("cpu"), det_loss_weight=0.5,
     )
 
-    assert result.edge_loss == pytest.approx(3.0)
+    expected_edge_loss = 3.0 if valid_pairs else 0.0
+    assert result.edge_loss == pytest.approx(expected_edge_loss)
     assert result.det_loss == pytest.approx(2.0)
-    assert result.loss == pytest.approx(4.0)
-    assert result.edge_accuracy == pytest.approx(0.5)
+    assert result.loss == pytest.approx(expected_edge_loss + 1.0)
+    assert result.edge_accuracy == pytest.approx(0.5 if valid_pairs else 0.0)
     assert result.detection_node_recall == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("shape", [(0, 0), (0, 2), (2, 0), (2, 2)])
+def test_evaluate_pair_without_active_rows(shape: tuple[int, int]) -> None:
+    assert training._evaluate_pair(torch.zeros(shape), torch.zeros(shape)) == (0.0, 0, 0)
+
+
+@pytest.mark.parametrize("wrap_unet", [False, True])
+def test_resume_restores_cpu_model_and_optimizer_before_training(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, wrap_unet: bool,
+) -> None:
+    events = []
+
+    class TinyModel(torch.nn.Module):
+        def __init__(self, unet, **kwargs):
+            super().__init__()
+            self.unet = unet
+
+        def load_state_dict(self, state, **kwargs):
+            assert not isinstance(self.unet, torch.nn.DataParallel)
+            assert all(value.device.type == "cpu" for value in state.values())
+            events.append("load")
+            return super().load_state_dict(state, **kwargs)
+
+        def to(self, *args, **kwargs):
+            events.append("to")
+            return super().to(*args, **kwargs)
+
+    source = TinyModel(torch.nn.Linear(1, 1))
+    optimizer = torch.optim.AdamW(source.parameters(), lr=0.012)
+    source.unet(torch.ones(1, 1)).sum().backward()
+    optimizer.step()
+    expected = {key: value.clone() for key, value in source.state_dict().items()}
+    resume = tmp_path / "resume.pth"
+    torch.save({
+        "model_state_dict": expected,
+        "optimizer_state_dict": optimizer.state_dict(),
+        "epoch": 1,
+        "global_step": 7,
+    }, resume)
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(training, "WEIGHTS_PATH", tmp_path / "weights")
+    monkeypatch.setattr(training, "RUNS_PATH", tmp_path / "runs")
+    monkeypatch.setattr(training, "TemporalUNet3D", lambda **kwargs: torch.nn.Linear(1, 1))
+    monkeypatch.setattr(training, "UNetNodeTransformer", TinyModel)
+    monkeypatch.setattr(training, "load_dataset_windows", lambda *args, **kwargs: (
+        None, [SimpleNamespace(node_counts=[1, 1])],
+    ))
+    monkeypatch.setattr(training, "FrameWindowDataset", lambda *args, **kwargs: [0])
+
+    def fake_train_epoch(model, loader, restored_optimizer, *args, **kwargs):
+        assert events == ["load", "to"]
+        assert kwargs["global_step"] == 7
+        for key, value in model.state_dict().items():
+            torch.testing.assert_close(value, expected[key])
+        assert restored_optimizer.param_groups[0]["lr"] == 0.012
+        for actual, original in zip(restored_optimizer.state.values(), optimizer.state.values(), strict=True):
+            for key in original:
+                torch.testing.assert_close(actual[key], original[key])
+        if wrap_unet:
+            model.unet = torch.nn.DataParallel(model.unet)
+        return 1.0, 2.0, 8
+
+    monkeypatch.setattr(training, "train_epoch", fake_train_epoch)
+    monkeypatch.setattr(training, "evaluate", lambda *args, **kwargs: (
+        training.ValidationLosses(1.0, 2.0, 3.0, 1.0, 1.0)
+    ))
+    monkeypatch.setattr(training, "evaluate_tracking_metrics", lambda *args, **kwargs: dict.fromkeys(
+        ["score", "edge_jaccard", "adj_edge_jaccard", "division_jaccard", "over_detection_penalty"], 1.0,
+    ))
+
+    model = training.train(
+        data_dir=tmp_path, fold=0, splits_file=tmp_path / "unused.json",
+        debug_video=tmp_path / "video", resume=resume, n_epochs=2, num_workers=0,
+    )
+
+    assert events == ["load", "to", "load", "to"]
+    saved = torch.load(
+        tmp_path / "weights/unet_transformer/split_0/checkpoints/checkpoint_epoch_0002.pth",
+        map_location="cpu", weights_only=True,
+    )
+    assert saved["epoch"] == 2
+    assert saved["global_step"] == 8
+    for key, value in model.state_dict().items():
+        torch.testing.assert_close(value, expected[key])
 
 
 def test_full_video_metrics_include_counts_and_over_detection_penalty(

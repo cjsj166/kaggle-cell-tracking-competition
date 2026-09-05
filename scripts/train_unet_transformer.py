@@ -1020,6 +1020,8 @@ def evaluate(
                 pair_loss, pair_correct, pair_total = _evaluate_pair(
                     pair_logits[b, :ns_b, :nt_b], pair_target[b, :ns_b, :nt_b],
                 )
+                if pair_total == 0:
+                    continue
                 total_edge_loss += pair_loss
                 correct += pair_correct
                 total += pair_total
@@ -1167,19 +1169,6 @@ def _canonical_model_state(model: UNetNodeTransformer) -> dict[str, torch.Tensor
     }
 
 
-def _load_model_state(
-    model: UNetNodeTransformer,
-    state: dict[str, torch.Tensor],
-) -> None:
-    """Load a canonical state dict into a single- or multi-GPU model."""
-    if isinstance(model.unet, nn.DataParallel):
-        state = {
-            (key.replace("unet.", "unet.module.", 1) if key.startswith("unet.") else key): value
-            for key, value in state.items()
-        }
-    model.load_state_dict(state)
-
-
 # =============================================================================
 # Main training function
 # =============================================================================
@@ -1219,7 +1208,7 @@ def train(
 
     if debug_video is not None:
         train_files = test_files = [debug_video]
-        print(f"Debug mode: using single video {debug_video.name}", flush=True)
+        print(f"Debug mode: using single video {debug_video.name}")
     else:
         if splits_file.exists():
             folds = json.loads(splits_file.read_text())
@@ -1236,11 +1225,11 @@ def train(
             n_val = max(1, len(stems) // 10)
             folds = [{"split": 0, "train": stems[n_val:], "test": stems[:n_val]}]
             print(f"No splits file at {splits_file}; generated seed-0 split "
-                  f"({len(stems) - n_val} train / {n_val} val).", flush=True)
+                  f"({len(stems) - n_val} train / {n_val} val).")
         fold_data = folds[fold]
         train_files = [data_dir / name for name in fold_data["train"]]
         test_files = [data_dir / name for name in fold_data["test"]]
-        print(f"Fold {fold}: {len(train_files)} train, {len(test_files)} test", flush=True)
+        print(f"Fold {fold}: {len(train_files)} train, {len(test_files)} test")
 
     output_dir = WEIGHTS_PATH / method / f"split_{fold}"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1258,7 +1247,7 @@ def train(
     def _load(
         files: list[Path], desc: str,
     ) -> list[tuple[VideoMeta, list[FrameWindowData]]]:
-        print(f"Loading {desc} ({len(files)} datasets)...", flush=True)
+        print(f"Loading {desc} ({len(files)} datasets)...")
         data: list[tuple[VideoMeta, list[FrameWindowData]]] = []
         for f in tqdm(files, desc=desc, disable=False):
             video_meta, windows = load_dataset_windows(
@@ -1268,7 +1257,7 @@ def train(
             )
             data.append((video_meta, windows))
         n_windows = sum(len(w) for _, w in data)
-        print(f"  {desc} done: {n_windows} windows total", flush=True)
+        print(f"  {desc} done: {n_windows} windows total")
         return data
 
     train_video_data = _load(train_files, "train")
@@ -1277,7 +1266,7 @@ def train(
     # Compute consistent max_nodes across train + test.
     all_windows = [w for _, ws in train_video_data + test_video_data for w in ws]
     max_nodes = max(max(w.node_counts) for w in all_windows)
-    print(f"max_nodes={max_nodes}", flush=True)
+    print(f"max_nodes={max_nodes}")
 
     pos_feat_dim = 4 * _POS_EMBED_DIM
 
@@ -1308,7 +1297,7 @@ def train(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     n_visible = torch.cuda.device_count() if device.type == "cuda" else 0
-    print(f"Using device: {device} | visible CUDA GPUs: {n_visible}", flush=True)
+    print(f"Using device: {device} | visible CUDA GPUs: {n_visible}")
 
     unet = TemporalUNet3D(
         in_channels=1,
@@ -1318,13 +1307,21 @@ def train(
     if unet_weights is not None:
         state = torch.load(unet_weights, map_location="cpu", weights_only=True)
         missing, unexpected = unet.load_state_dict(state, strict=False)
-        print(f"  UNet weights: {len(missing)} missing, {len(unexpected)} unexpected", flush=True)
+        print(f"  UNet weights: {len(missing)} missing, {len(unexpected)} unexpected")
 
     model = UNetNodeTransformer(
         unet=unet,
         unet_out_channels=unet_out_channels,
         pos_feat_dim=pos_feat_dim,
-    ).to(device)
+    )
+
+    checkpoint = None
+    if resume is not None:
+        checkpoint = torch.load(resume, map_location="cpu", weights_only=True)
+        if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
+            raise ValueError(f"Not a training checkpoint: {resume}")
+        model.load_state_dict(checkpoint["model_state_dict"])
+    model.to(device)
 
     # Simple multi-GPU: split the heavy UNet pass across all visible GPUs.
     # Only the UNet is wrapped (it takes/returns plain batched tensors); the
@@ -1335,14 +1332,13 @@ def train(
         print(
             f"DataParallel: UNet split across {n_visible} GPUs "
             f"(effective per-GPU batch {max(1, batch_size // n_visible)})",
-            flush=True,
         )
     elif device.type == "cuda":
         reason = "--single-gpu set" if not data_parallel else f"only {n_visible} GPU visible"
-        print(f"Single-GPU training ({reason}). For 2 GPUs set the Kaggle accelerator to 'GPU T4 x2'.", flush=True)
+        print(f"Single-GPU training ({reason}). For 2 GPUs set the Kaggle accelerator to 'GPU T4 x2'.")
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model parameters: {n_params:,}", flush=True)
+    print(f"Model parameters: {n_params:,}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     start_epoch = 0
@@ -1353,29 +1349,24 @@ def train(
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     run_dir = RUNS_PATH / method / f"split_{fold}" / datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    if resume is not None:
-        checkpoint = torch.load(resume, map_location=device, weights_only=True)
-        if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
-            raise ValueError(f"Not a training checkpoint: {resume}")
-        _load_model_state(model, checkpoint["model_state_dict"])
+    if checkpoint is not None:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_epoch = int(checkpoint["epoch"])
         global_step = int(checkpoint.get("global_step", 0))
         print(
             f"Resumed {resume}: completed_epochs={start_epoch}, "
             f"global_step={global_step}",
-            flush=True,
         )
+        del checkpoint
 
     print(
         f"Starting training at epoch {start_epoch + 1} of {n_epochs} "
         f"(batch_size={batch_size})...",
-        flush=True,
     )
     writer = SummaryWriter(log_dir=str(run_dir))
-    print(f"TensorBoard logs: {run_dir}", flush=True)
+    print(f"TensorBoard logs: {run_dir}")
     pbar = tqdm(range(start_epoch, n_epochs), desc="Training", disable=False)
-    print(f"Detection loss: weight={det_loss_weight}, neg_weight={det_neg_weight}", flush=True)
+    print(f"Detection loss: weight={det_loss_weight}, neg_weight={det_neg_weight}")
 
     try:
         for epoch in pbar:
@@ -1433,7 +1424,6 @@ def train(
             log_validation_to_tensorboard(
                 writer, validation_losses, validation_metrics, epoch_number,
             )
-            writer.flush()
 
             marker = "*" if is_best else " "
             pbar.set_postfix(
@@ -1451,15 +1441,18 @@ def train(
                 f"best={best_score:.4f} {marker} | train={train_time:.1f}s "
                 f"validation={validation_time:.1f}s | "
                 f"checkpoint={checkpoint_path}",
-                flush=True,
             )
     finally:
         writer.close()
 
-    print(f"\nBest score (acc*recall): {best_score:.4f}, saved to {save_path}", flush=True)
+    print(f"\nBest score (acc*recall): {best_score:.4f}, saved to {save_path}")
     if save_path.exists():
-        state = torch.load(save_path, map_location=device, weights_only=True)
-        _load_model_state(model, state)
+        state = torch.load(save_path, map_location="cpu", weights_only=True)
+        if isinstance(model.unet, nn.DataParallel):
+            model.unet = model.unet.module
+        model.cpu()
+        model.load_state_dict(state)
+        model.to(device)
     return model
 
 
