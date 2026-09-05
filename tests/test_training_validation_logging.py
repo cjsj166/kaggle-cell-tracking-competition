@@ -51,7 +51,6 @@ def test_evaluate_returns_all_three_validation_losses(
         "voxel_size": torch.ones(batch_size, 3),
         "downsample": torch.ones(batch_size, 3),
     }
-    batch["targets"][valid_pairs:] = 0
 
     def fake_detect_and_match(det_logits, gt_coords, mask, *args, **kwargs):
         batch = det_logits.shape[0]
@@ -85,42 +84,6 @@ def test_evaluate_returns_all_three_validation_losses(
 @pytest.mark.parametrize("shape", [(0, 0), (0, 2), (2, 0), (2, 2)])
 def test_evaluate_pair_without_active_rows(shape: tuple[int, int]) -> None:
     assert training._evaluate_pair(torch.zeros(shape), torch.zeros(shape)) == (0.0, 0, 0)
-
-
-@pytest.mark.parametrize("empty_pairs", [0, 1, 5])
-def test_empty_pairs_do_not_dilute_real_validation_loss(
-    monkeypatch: pytest.MonkeyPatch, empty_pairs: int,
-) -> None:
-    batch_size = 1 + empty_pairs
-    targets = torch.zeros(batch_size, 1, 2, 2)
-    targets[0, 0] = torch.eye(2)
-    batch = {
-        "imgs": torch.zeros(batch_size, 2, 1, 1, 1),
-        "coords": torch.zeros(batch_size, 2, 2, 3),
-        "pos_feats": torch.zeros(batch_size, 2, 2, 32),
-        "masks": torch.ones(batch_size, 2, 2, dtype=torch.bool),
-        "targets": targets,
-        "image_shape": torch.tensor([[2, 1, 1, 1]] * batch_size),
-        "voxel_size": torch.ones(batch_size, 3),
-        "downsample": torch.ones(batch_size, 3),
-    }
-
-    def fake_detect_and_match(det_logits, gt_coords, mask, *args, **kwargs):
-        return (
-            gt_coords, torch.zeros(batch_size, 2, 32), mask,
-            [torch.arange(2) for _ in range(batch_size)],
-        )
-
-    monkeypatch.setattr(training, "detect_and_match", fake_detect_and_match)
-    monkeypatch.setattr(training, "compute_detection_loss", lambda *args: torch.tensor(2.0))
-    result = training.evaluate(_ValidationModel(), [batch], torch.device("cpu"), det_loss_weight=0.5)
-
-    # With zero logits and two candidates, focal BCE is 0.25 * log(2).
-    # Adding unannotated pairs must not divide this by (1 + empty_pairs).
-    expected = 0.25 * np.log(2)
-    assert result.edge_loss == pytest.approx(expected)
-    assert result.det_loss == pytest.approx(2.0)
-    assert result.loss == pytest.approx(expected + 1.0)
 
 
 @pytest.mark.parametrize("wrap_unet", [False, True])

@@ -958,7 +958,7 @@ def evaluate(
     """
     model.eval()
     total_edge_loss, total_det_loss = 0.0, 0.0
-    correct, total, n_valid_pairs, n_samples = 0, 0, 0, 0
+    correct, total, n_pairs, n_samples = 0, 0, 0, 0
     gt_matched, gt_total = 0, 0
 
     for batch in loader:
@@ -1022,20 +1022,17 @@ def evaluate(
             for b in range(B):
                 ns_b = int(frame_det[i][2][b].sum().item())
                 nt_b = int(frame_det[i + 1][2][b].sum().item())
-                target_b = pair_target[b, :ns_b, :nt_b]
-                # Match compute_loss's active-row criterion: pairs without
-                # supervised edges contribute to neither the sum nor its divisor.
-                if not (target_b.sum(dim=1) > 0).any():
-                    continue
                 pair_loss, pair_correct, pair_total = _evaluate_pair(
-                    pair_logits[b, :ns_b, :nt_b], target_b,
+                    pair_logits[b, :ns_b, :nt_b], pair_target[b, :ns_b, :nt_b],
                 )
+                if pair_total == 0:
+                    continue
                 total_edge_loss += pair_loss
-                n_valid_pairs += 1
                 correct += pair_correct
                 total += pair_total
+                n_pairs += 1
 
-    edge_loss = total_edge_loss / max(n_valid_pairs, 1)
+    edge_loss = total_edge_loss / max(n_pairs, 1)
     det_loss = total_det_loss / max(n_samples, 1)
     return ValidationLosses(
         edge_loss=edge_loss,
