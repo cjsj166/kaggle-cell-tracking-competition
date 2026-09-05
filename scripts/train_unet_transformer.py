@@ -1101,13 +1101,8 @@ def evaluate_tracking_metrics(
         name: float(sum(row[name] for row in rows))
         for name in COUNT_COLUMNS
     }
-    # GEFF metadata may omit the estimated node count.
-    estimated_rows = [
-        row for row in rows
-        if row["estimated_num_nodes"] == row["estimated_num_nodes"]
-    ]
-    estimated_num_nodes = sum(row["estimated_num_nodes"] for row in estimated_rows)
-    estimated_pred_nodes = sum(row["num_pred_nodes"] for row in estimated_rows)
+    estimated_num_nodes = sum(row["estimated_num_nodes"] for row in rows)
+    estimated_pred_nodes = totals["num_pred_nodes"]
     if estimated_num_nodes > 0:
         total_node_ratio = (
             estimated_pred_nodes - estimated_num_nodes

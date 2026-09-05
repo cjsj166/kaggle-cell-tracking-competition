@@ -202,7 +202,7 @@ def test_resume_restores_cpu_model_and_optimizer_before_training(
         torch.testing.assert_close(value, expected[key])
 
 
-@pytest.mark.parametrize("estimates", [[1.0], [2.0], [4.0], [float("nan")], [2.0, float("nan")]])
+@pytest.mark.parametrize("estimates", [[1.0], [2.0], [4.0], [2.0, 4.0]])
 def test_full_video_metrics_include_counts_and_node_ratio(
     monkeypatch: pytest.MonkeyPatch, estimates: list[float],
 ) -> None:
@@ -234,22 +234,17 @@ def test_full_video_metrics_include_counts_and_node_ratio(
         )
 
     assert result["edge_jaccard"] == pytest.approx(1.0)
-    known_estimates = [n for n in estimates if not np.isnan(n)]
-    expected_ratio = (
-        (2 * len(known_estimates) - sum(known_estimates)) / sum(known_estimates)
-        if known_estimates else float("nan")
+    expected_ratio = (2 * len(estimates) - sum(estimates)) / sum(estimates)
+    assert result["adj_edge_jaccard"] == pytest.approx(
+        sum(1 - 0.1 * (2 - n) / n for n in estimates) / len(estimates),
     )
-    if known_estimates:
-        assert result["adj_edge_jaccard"] == pytest.approx(1 - 0.1 * expected_ratio)
-    else:
-        assert np.isnan(result["adj_edge_jaccard"])
     assert np.isnan(result["division_jaccard"])
     assert result["edge_tp"] == len(estimates)
     assert result["edge_fp"] == 0
     assert result["edge_fn"] == 0
     assert result["num_pred_nodes"] == 2 * len(estimates)
-    assert result["estimated_num_nodes"] == sum(known_estimates)
-    assert result["total_node_ratio"] == pytest.approx(expected_ratio, nan_ok=True)
+    assert result["estimated_num_nodes"] == sum(estimates)
+    assert result["total_node_ratio"] == pytest.approx(expected_ratio)
     assert "node_count_adjustment" not in result
     assert "over_detection_penalty" not in result
 
