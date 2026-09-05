@@ -32,6 +32,14 @@ from tqdm import tqdm
 import tracksdata as td
 
 from tracking_cellmot.io import invert_time_graph, open_dataset
+from tracking_cellmot.metrics import (
+    ADJUSTMENT_ALPHA,
+    COUNT_COLUMNS,
+    evaluate as compute_tracking_metric,
+    node_recall,
+    per_sample_metrics,
+    summarise,
+)
 from tracking_cellmot.models import SimpleNodeTransformer, TemporalUNet3D
 
 from itertools import cycle as _cycle
@@ -114,6 +122,7 @@ from augmentations import brightness_augment, flip_augment
 
 DEFAULT_AUGMENTATIONS = [brightness_augment, flip_augment]
 from dataspec import RUNS_PATH, WEIGHTS_PATH
+from evaluate import _read_estimated_n_total
 
 DEFAULT_METHOD = "unet_transformer"
 _POS_EMBED_DIM = 8   # per axis; total = 4 axes × _POS_EMBED_DIM = 32
@@ -372,7 +381,6 @@ def load_dataset_windows(
     ds_path: Path,
     window_size: int = 2,
     invert_time: bool = False,
-    max_frames: int | None = None,
     downsample: tuple[int, ...] = (1, 1, 1),
 ) -> tuple[VideoMeta, list[FrameWindowData]]:
     """Load per-window metadata and video stats for one dataset.
@@ -396,10 +404,6 @@ def load_dataset_windows(
 
     if invert_time:
         tracks = invert_time_graph(tracks, max_t=image_shape[0])
-
-    if max_frames is not None:
-        image_shape = (max_frames, *image_shape[1:])
-        tracks = tracks.filter(td.NodeAttr("t") < max_frames).subgraph()
 
     video_meta = VideoMeta(
         zarr_path=ds.zarr_path,
@@ -1046,19 +1050,10 @@ def evaluate_tracking_metrics(
     window_size: int,
     downsample: tuple[int, ...],
     pool_kernel_um: float,
-    max_frames: int | None = None,
 ) -> dict[str, float]:
     """Run full-video validation and aggregate every competition metric."""
-    from evaluate import _read_estimated_n_total
+    # Prediction imports the model from this module; defer to avoid a circular import.
     from predict_unet_transformer import PredictConfig, build_graph, predict_video
-    from tracking_cellmot.metrics import (
-        ADJUSTMENT_ALPHA,
-        COUNT_COLUMNS,
-        evaluate as compute_tracking_metric,
-        node_recall,
-        per_sample_metrics,
-        summarise,
-    )
 
     predict_config = PredictConfig(
         det_threshold=0.5,
@@ -1078,21 +1073,14 @@ def evaluate_tracking_metrics(
             device,
             cfg=predict_config,
             window_size=window_size,
-            max_frames=max_frames,
             downsample=downsample,
         )
         pred_graph = build_graph(coords, edges)
         dataset = open_dataset(dataset_path, require_tracks=True, load_image=False)
         gt_graph = dataset.tracks
         assert gt_graph is not None
-        assert dataset.image_shape is not None
 
         n_total = _read_estimated_n_total(dataset_path.with_suffix(".geff"))
-        if max_frames is not None:
-            frame_count = min(max_frames, dataset.image_shape[0])
-            gt_graph = gt_graph.filter(td.NodeAttr("t") < frame_count).subgraph()
-            if n_total == n_total:
-                n_total *= frame_count / dataset.image_shape[0]
 
         result = compute_tracking_metric(pred_graph, gt_graph, scale=dataset.scale)
         recall = (
@@ -1191,7 +1179,6 @@ def train(
     max_iters: int | None = None,
     debug_video: Path | None = None,
     seed: int | None = None,
-    max_frames: int | None = None,
     window_size: int = 2,
     augmentations: list | None = DEFAULT_AUGMENTATIONS,
     pool_kernel_um: float = 5.0,
@@ -1252,7 +1239,6 @@ def train(
         for f in tqdm(files, desc=desc, disable=False):
             video_meta, windows = load_dataset_windows(
                 f, window_size=window_size,
-                max_frames=max_frames,
                 downsample=downsample,
             )
             data.append((video_meta, windows))
@@ -1394,7 +1380,6 @@ def train(
                 window_size=window_size,
                 downsample=downsample,
                 pool_kernel_um=pool_kernel_um,
-                max_frames=max_frames,
             )
             validation_time = time.monotonic() - t0
 
