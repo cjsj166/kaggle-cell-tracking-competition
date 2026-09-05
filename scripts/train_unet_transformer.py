@@ -33,7 +33,6 @@ import tracksdata as td
 
 from tracking_cellmot.io import invert_time_graph, open_dataset
 from tracking_cellmot.metrics import (
-    ADJUSTMENT_ALPHA,
     COUNT_COLUMNS,
     evaluate as compute_tracking_metric,
     node_recall,
@@ -1098,13 +1097,13 @@ def evaluate_tracking_metrics(
         rows.append(row)
 
     summary = summarise(rows)
-    valid_rows = [row for row in rows if row["edge_tp"] == row["edge_tp"]]
     totals = {
-        name: float(sum(row[name] for row in valid_rows))
+        name: float(sum(row[name] for row in rows))
         for name in COUNT_COLUMNS
     }
+    # GEFF metadata may omit the estimated node count.
     estimated_rows = [
-        row for row in valid_rows
+        row for row in rows
         if row["estimated_num_nodes"] == row["estimated_num_nodes"]
     ]
     estimated_num_nodes = sum(row["estimated_num_nodes"] for row in estimated_rows)
@@ -1113,24 +1112,14 @@ def evaluate_tracking_metrics(
         total_node_ratio = (
             estimated_pred_nodes - estimated_num_nodes
         ) / estimated_num_nodes
-        node_count_adjustment = max(
-            0.0, 1.0 - ADJUSTMENT_ALPHA * total_node_ratio,
-        )
-        over_detection_penalty = min(
-            1.0, max(0.0, ADJUSTMENT_ALPHA * total_node_ratio),
-        )
     else:
         total_node_ratio = float("nan")
-        node_count_adjustment = float("nan")
-        over_detection_penalty = float("nan")
 
     return {
         **{name: float(value) for name, value in summary.items()},
         **totals,
         "estimated_num_nodes": float(estimated_num_nodes),
         "total_node_ratio": total_node_ratio,
-        "node_count_adjustment": node_count_adjustment,
-        "over_detection_penalty": over_detection_penalty,
     }
 
 
@@ -1429,7 +1418,7 @@ def train(
                 f"edge_jaccard={validation_metrics['edge_jaccard']:.4f} | "
                 f"adj_edge_jaccard={validation_metrics['adj_edge_jaccard']:.4f} | "
                 f"division_jaccard={validation_metrics['division_jaccard']:.4f} | "
-                f"over_detection_penalty={validation_metrics['over_detection_penalty']:.4f} | "
+                f"total_node_ratio={validation_metrics['total_node_ratio']:+.4f} | "
                 f"best={best_score:.4f} {marker} | train={train_time:.1f}s "
                 f"validation={validation_time:.1f}s | "
                 f"checkpoint={checkpoint_path}",

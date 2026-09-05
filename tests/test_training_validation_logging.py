@@ -183,7 +183,7 @@ def test_resume_restores_cpu_model_and_optimizer_before_training(
         training.ValidationLosses(1.0, 2.0, 3.0, 1.0, 1.0)
     ))
     monkeypatch.setattr(training, "evaluate_tracking_metrics", lambda *args, **kwargs: dict.fromkeys(
-        ["score", "edge_jaccard", "adj_edge_jaccard", "division_jaccard", "over_detection_penalty"], 1.0,
+        ["score", "edge_jaccard", "adj_edge_jaccard", "division_jaccard", "total_node_ratio"], 1.0,
     ))
 
     model = training.train(
@@ -202,8 +202,9 @@ def test_resume_restores_cpu_model_and_optimizer_before_training(
         torch.testing.assert_close(value, expected[key])
 
 
-def test_full_video_metrics_include_counts_and_over_detection_penalty(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("estimates", [[1.0], [2.0], [4.0], [float("nan")], [2.0, float("nan")]])
+def test_full_video_metrics_include_counts_and_node_ratio(
+    monkeypatch: pytest.MonkeyPatch, estimates: list[float],
 ) -> None:
     coords = np.array([[0, 0, 0, 0], [1, 0, 0, 0]], dtype=np.int16)
     edges = [(0, 1, 0.9, 0.0)]
@@ -219,12 +220,13 @@ def test_full_video_metrics_include_counts_and_over_detection_penalty(
             image_shape=(2, 1, 1, 1),
         ),
     )
-    monkeypatch.setattr(training, "_read_estimated_n_total", lambda path: 2.0)
+    estimate_iter = iter(estimates)
+    monkeypatch.setattr(training, "_read_estimated_n_total", lambda path: next(estimate_iter))
 
     with pytest.warns(UserWarning, match="No divisions"):
         result = training.evaluate_tracking_metrics(
             _ValidationModel(),
-            [Path("video")],
+            [Path(f"video_{i}") for i in range(len(estimates))],
             torch.device("cpu"),
             window_size=2,
             downsample=(1, 1, 1),
@@ -232,15 +234,24 @@ def test_full_video_metrics_include_counts_and_over_detection_penalty(
         )
 
     assert result["edge_jaccard"] == pytest.approx(1.0)
-    assert result["adj_edge_jaccard"] == pytest.approx(1.0)
+    known_estimates = [n for n in estimates if not np.isnan(n)]
+    expected_ratio = (
+        (2 * len(known_estimates) - sum(known_estimates)) / sum(known_estimates)
+        if known_estimates else float("nan")
+    )
+    if known_estimates:
+        assert result["adj_edge_jaccard"] == pytest.approx(1 - 0.1 * expected_ratio)
+    else:
+        assert np.isnan(result["adj_edge_jaccard"])
     assert np.isnan(result["division_jaccard"])
-    assert result["edge_tp"] == 1
+    assert result["edge_tp"] == len(estimates)
     assert result["edge_fp"] == 0
     assert result["edge_fn"] == 0
-    assert result["num_pred_nodes"] == 2
-    assert result["total_node_ratio"] == pytest.approx(0.0)
-    assert result["node_count_adjustment"] == pytest.approx(1.0)
-    assert result["over_detection_penalty"] == pytest.approx(0.0)
+    assert result["num_pred_nodes"] == 2 * len(estimates)
+    assert result["estimated_num_nodes"] == sum(known_estimates)
+    assert result["total_node_ratio"] == pytest.approx(expected_ratio, nan_ok=True)
+    assert "node_count_adjustment" not in result
+    assert "over_detection_penalty" not in result
 
 
 def test_tensorboard_logging_writes_every_validation_value() -> None:
@@ -254,7 +265,7 @@ def test_tensorboard_logging_writes_every_validation_value() -> None:
         "edge_jaccard": 0.8,
         "adj_edge_jaccard": 0.7,
         "division_jaccard": 1.0,
-        "over_detection_penalty": 0.1,
+        "total_node_ratio": 0.1,
     }
 
     training.log_validation_to_tensorboard(writer, losses, metrics, epoch=4)
