@@ -1176,12 +1176,18 @@ def train(
     pool_kernel_um: float = 5.0,
     data_parallel: bool = True,
     resume: Path | None = None,
+    max_datasets: int | None = None,
 ) -> UNetNodeTransformer:
     """Train on one fold from a pre-computed splits file.
 
     If *debug_video* is set the splits file is ignored and that single dataset
     is used for both train and test (quick sanity-check / overfitting run).
     """
+    if max_datasets is not None and max_datasets < 1:
+        raise ValueError("max_datasets must be positive")
+    if window_size < 2:
+        raise ValueError("window_size must be at least 2")
+
     if unet_layers is None:
         unet_layers = [32, 64, 128]
 
@@ -1209,6 +1215,10 @@ def train(
         train_files = [data_dir / name for name in fold_data["train"]]
         test_files = [data_dir / name for name in fold_data["test"]]
         print(f"Fold {fold}: {len(train_files)} train, {len(test_files)} test")
+
+    if max_datasets is not None:
+        train_files = train_files[:max_datasets]
+        test_files = test_files[:max_datasets]
 
     output_dir = WEIGHTS_PATH / method / f"split_{fold}"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1466,6 +1476,8 @@ def main() -> None:
                         help="Smoke-test only: override optimizer steps per epoch, cycling the "
                              "loader as needed. Leave unset for real training so each epoch is "
                              "one full loader pass.")
+    parser.add_argument("--max-datasets", type=int, default=None,
+                        help="Load only the first N datasets of each train/validation split.")
     parser.add_argument("--debug-video", type=str, default=None,
                         help="Path to a single dataset for quick debugging. "
                              "Ignores --fold and splits file; trains and evaluates on this video only.")
@@ -1482,6 +1494,10 @@ def main() -> None:
                         help="Resume from an epoch checkpoint. --epochs remains the total target epoch count.")
 
     args = parser.parse_args()
+    if args.max_datasets is not None and args.max_datasets < 1:
+        parser.error("--max-datasets must be positive")
+    if args.window_size < 2:
+        parser.error("--window-size must be at least 2")
 
     from dataspec import DATASET_PATH
     data_dir = Path(args.data_dir) if args.data_dir else Path(DATASET_PATH)
@@ -1516,6 +1532,7 @@ def main() -> None:
             det_loss_weight=args.det_loss_weight,
             det_neg_weight=args.det_neg_weight,
             max_iters=args.max_iters,
+            max_datasets=args.max_datasets,
             debug_video=debug_video,
             window_size=args.window_size,
             pool_kernel_um=args.pool_kernel_um,
