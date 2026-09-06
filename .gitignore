@@ -10,11 +10,11 @@ uv.lock
 # Data and outputs
 data/
 tests/data/
-weights/
+weights
 predictions/
 results/
 videos/
-runs/
+runs
 
 # IDE
 .vscode/
