@@ -13,7 +13,6 @@ readme = "README.md"
 requires-python = ">=3.11,<3.14"
 license = "BSD-3-Clause"
 dependencies = [
-    "torch>=2.9.1",
     "tracksdata @ git+https://github.com/royerlab/tracksdata@main",
     "zarr>=3.0.10",
     "scipy",
@@ -22,6 +21,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Select exactly one CUDA build when syncing/running:
+#   GTX 1080 Ti (Pascal, sm_61): uv sync --extra cu126
+#   Newer GPUs:                  uv sync --extra cu130
+cu126 = [
+    "torch==2.14.0",
+]
+cu130 = [
+    "torch==2.14.0",
+]
 dev = [
     "pytest>=8.4.2",
 ]
@@ -29,6 +37,30 @@ viz = [
     "napari>=0.5",
     "pyqt5",
 ]
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "cu126" },
+        { extra = "cu130" },
+    ],
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu126", extra = "cu126" },
+    { index = "pytorch-cu130", extra = "cu130" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
 
 [dependency-groups]
 dev = [

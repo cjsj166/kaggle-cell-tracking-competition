@@ -23,3 +23,4 @@ runs/
 # Local config
 .env
 /kaggle_csvs
+kaggle
