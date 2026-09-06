@@ -1099,13 +1099,6 @@ def train(
     train_video_data = _load(train_files, "train")
     test_video_data = _load(test_files, "test")
 
-    for name, data in (("train", train_video_data), ("validation", test_video_data)):
-        if not any(windows for _, windows in data):
-            raise ValueError(
-                f"No usable {name} windows; increase max_datasets "
-                "or check the split and annotations."
-            )
-
     # Compute consistent max_nodes across train + test.
     all_windows = [w for _, ws in train_video_data + test_video_data for w in ws]
     max_nodes = max(max(w.node_counts) for w in all_windows)

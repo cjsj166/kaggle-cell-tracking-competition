@@ -15,13 +15,18 @@ def test_dataset_limit_applies_before_opening_files(monkeypatch, tmp_path):
     splits.write_text(json.dumps([{"train": ["a", "b"], "test": ["c", "d"]}]))
     opened = []
 
+    class LoadingComplete(Exception):
+        pass
+
     def load(path, **kwargs):
         opened.append((path.name, kwargs["max_frames"]))
+        if path.name == "c":
+            raise LoadingComplete
         return None, []
 
     monkeypatch.setattr(training, "WEIGHTS_PATH", tmp_path / "weights")
     monkeypatch.setattr(training, "load_dataset_windows", load)
-    with pytest.raises(ValueError, match="No usable train windows"):
+    with pytest.raises(LoadingComplete):
         training.train(tmp_path, 0, splits, max_datasets=1, max_frames=4)
     assert opened == [("a", 4), ("c", 4)]
 
