@@ -69,13 +69,24 @@ namespace:
 | `loss`, `edge_loss`, `det_loss` | Combined, edge, and detection validation losses |
 | `edge_accuracy`, `detection_node_recall` | Window-level validation diagnostics |
 
-To resume from epoch 10 and train until a total of 50 epochs:
+#### Resume training
+
+Pass an epoch checkpoint from the `checkpoints/` directory to `--resume`. Do
+not use `edge_predictor_best.pth`: it contains model weights only, whereas an
+epoch checkpoint also contains the optimizer, completed epoch, and global
+step. For example, resume split 0 after epoch 10 and continue until epoch 50:
 
 ```bash
 uv run python scripts/train_unet_transformer.py \
     --data-dir data/train --split 0 --epochs 50 \
     --resume weights/unet_transformer/split_0/checkpoints/checkpoint_epoch_0010.pth
 ```
+
+`--epochs` is the final target epoch, not the number of additional epochs. If
+the original run used non-default model options, pass the same options when
+resuming.
+
+#### TensorBoard
 
 Start TensorBoard so it is reachable from outside the current environment:
 
