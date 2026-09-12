@@ -69,7 +69,7 @@ def test_evaluate_returns_all_three_validation_losses(
     monkeypatch.setattr(training, "_evaluate_pair", lambda *args: next(pair_results))
 
     result = training.evaluate(
-        _ValidationModel(), [batch], torch.device("cpu"), det_loss_weight=0.5,
+        _ValidationModel(), [batch], torch.device("cpu"), det_loss_weight=0.5, det_neg_weight=0.1,
     )
 
     expected_edge_loss = 3.0 if valid_pairs else 0.0
@@ -111,7 +111,7 @@ def test_empty_pairs_do_not_dilute_real_validation_loss(
 
     monkeypatch.setattr(training, "detect_and_match", fake_detect_and_match)
     monkeypatch.setattr(training, "compute_detection_loss", lambda *args: torch.tensor(2.0))
-    result = training.evaluate(_ValidationModel(), [batch], torch.device("cpu"), det_loss_weight=0.5)
+    result = training.evaluate(_ValidationModel(), [batch], torch.device("cpu"), det_loss_weight=0.5, det_neg_weight=0.1)
 
     # With zero logits and two candidates, focal BCE is 0.25 * log(2).
     # Adding unannotated pairs must not divide this by (1 + empty_pairs).
@@ -210,7 +210,6 @@ def test_full_video_metrics_include_counts_and_node_ratio(
     edges = [(0, 1, 0.9, 0.0)]
     gt_graph = prediction.build_graph(coords, edges)
 
-    monkeypatch.setattr(prediction, "predict_video", lambda *args, **kwargs: (coords, edges))
     monkeypatch.setattr(
         training,
         "open_dataset",
@@ -225,12 +224,9 @@ def test_full_video_metrics_include_counts_and_node_ratio(
 
     with pytest.warns(UserWarning, match="No divisions"):
         result = training.evaluate_tracking_metrics(
-            _ValidationModel(),
-            [Path(f"video_{i}") for i in range(len(estimates))],
-            torch.device("cpu"),
-            window_size=2,
-            downsample=(1, 1, 1),
-            pool_kernel_um=5.0,
+            {f"video_{i}": SimpleNamespace(
+                result=lambda: (coords, edges), seen_frames={0, 1}, seen_pairs={(0, 1)},
+            ) for i in range(len(estimates))},
         )
 
     assert result["edge_jaccard"] == pytest.approx(1.0)

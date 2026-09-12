@@ -41,7 +41,16 @@ Training losses are written to `runs/<method>/split_<fold>/<run-id>/` for
 TensorBoard. Every validation epoch also records edge, detection, and combined
 losses together with the full tracking score breakdown: adjusted and raw edge
 Jaccard, division Jaccard, node recall, TP/FP/FN counts, predicted/estimated
-node counts, and the over-detection penalty. A full training checkpoint is
+node counts, and the signed node-count ratio. Validation shares each window's
+UNet output between loss and tracking metrics. Loss retains window-local
+detections; tracking keeps each frame's first detected coordinates and extracts
+features from the current window, using the same assembly code as prediction.
+Tracking uses the training detection/edge thresholds without TTA or additional
+parent/child limits. Only frames and transitions supplied by the validation
+loader are scored; its GT filtering and `max_frames` behavior are unchanged.
+For partial movies, whole-movie node estimates are not rescaled: node-count
+ratios and adjusted scores for those movies are NaN, while raw Jaccards remain
+available. A full training checkpoint is
 saved after every epoch under
 `weights/<method>/split_<fold>/checkpoints/`. Resume from one while keeping
 `--epochs` as the total target epoch count:

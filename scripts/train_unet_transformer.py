@@ -369,6 +369,7 @@ class FrameWindowDataset(Dataset):
 
         return {
             **meta,
+            "video_id": str(vm.zarr_path),
             "imgs": imgs.half(),  # (W, *spatial)
             "image_shape": torch.tensor(vm.image_shape, dtype=torch.long),
             "voxel_size": torch.tensor(vm.voxel_size, dtype=torch.float32),
@@ -952,15 +953,22 @@ def evaluate(
     model: UNetNodeTransformer,
     loader: DataLoader,
     device: torch.device,
-    det_loss_weight: float = 0.1,
-    det_neg_weight: float = 0.1,
+    det_loss_weight: float,
+    det_neg_weight: float,
     pool_kernel_um: float = 5.0,
+    *,
+    predictions: dict | None = None,
 ) -> ValidationLosses:
     """Evaluate model using detect→match→predict (same path as training).
 
     Returns all three validation losses (edge, detection, combined), plus the
     inexpensive window-level edge accuracy and detection recall diagnostics.
+    If predictions is supplied, also collect movie graphs from these windows
+    without a second UNet pass. The loader must be ordered by time per video.
     """
+    # Prediction imports this module's model, so defer this circular import.
+    from predict_unet_transformer import VideoPredictionAccumulator
+
     model.eval()
     total_edge_loss, total_det_loss = 0.0, 0.0
     correct, total, n_pairs, n_samples = 0, 0, 0, 0
@@ -1009,6 +1017,25 @@ def evaluate(
                 gt_total += n_gt
                 gt_matched += n_matched
 
+        if predictions is not None:
+            for b in range(B):
+                video_id = batch["video_id"][b]
+                if video_id not in predictions:
+                    predictions[video_id] = VideoPredictionAccumulator(
+                        batch["downsample"][b].tolist(),
+                    )
+                t_start = int(batch["t_start"][b])
+                frame_indices = list(range(t_start, t_start + W))
+                frame_coords = []
+                for i, t in enumerate(frame_indices):
+                    n = int(frame_det[i][2][b].sum())
+                    xyz = frame_det[i][0][b, :n].cpu().numpy()
+                    frame_coords.append(np.column_stack((np.full(n, t), xyz)))
+                predictions[video_id].add_window(
+                    model, unet_out[b:b + 1], frame_coords, frame_indices,
+                    tuple(batch["image_shape"][b].tolist()),
+                )
+
         # Per-pair evaluation.
         for i in range(W - 1):
             ns = frame_det[i][0].shape[1]
@@ -1050,43 +1077,40 @@ def evaluate(
 
 @torch.no_grad()
 def evaluate_tracking_metrics(
-    model: UNetNodeTransformer,
-    dataset_paths: list[Path],
-    device: torch.device,
-    window_size: int,
-    downsample: tuple[int, ...],
-    pool_kernel_um: float,
+    predictions: dict,
 ) -> dict[str, float]:
-    """Run full-video validation and aggregate every competition metric."""
-    # Prediction imports the model from this module; defer to avoid a circular import.
-    from predict_unet_transformer import PredictConfig, build_graph, predict_video
+    """Score collected graphs only on frames and transitions the loader visited.
 
-    predict_config = PredictConfig(
-        det_threshold=0.5,
-        det_tta=False,
-        pool_kernel_um=pool_kernel_um,
-        edge_activation="softmax",
-        threshold=0.5,
-        max_parents_per_node=1,
-        max_children_per_node=2,
-    )
+    Whole-movie node estimates cannot calibrate a partial-movie prediction;
+    adjusted metrics are undefined for those movies (no proportional guess).
+    """
+    # Prediction imports the model from this module; defer to avoid a circular import.
+    from predict_unet_transformer import build_graph
     rows: list[dict] = []
 
-    for dataset_path in dataset_paths:
-        coords, edges = predict_video(
-            model,
-            dataset_path,
-            device,
-            cfg=predict_config,
-            window_size=window_size,
-            downsample=downsample,
-        )
+    for video_id, prediction in predictions.items():
+        dataset_path = Path(video_id)
+        coords, edges = prediction.result()
         pred_graph = build_graph(coords, edges)
         dataset = open_dataset(dataset_path, require_tracks=True, load_image=False)
         gt_graph = dataset.tracks
         assert gt_graph is not None
+        gt_graph = gt_graph.filter(
+            td.NodeAttr("t").is_in(sorted(prediction.seen_frames)),
+        ).subgraph()
+        # A gap between visited windows can leave adjacent retained frames
+        # whose connecting pair was never evaluated. Exclude that GT edge too.
+        node_times = dict(gt_graph.node_attrs(attr_keys=["node_id", "t"]).iter_rows())
+        edge_attrs = gt_graph.edge_attrs(attr_keys=["edge_id", "source_id", "target_id"])
+        valid_edges = [eid for eid, src, tgt in edge_attrs.iter_rows()
+                       if (node_times[src], node_times[tgt]) in prediction.seen_pairs]
+        gt_graph = gt_graph.filter(td.EdgeAttr("edge_id").is_in(valid_edges)).subgraph()
 
-        n_total = _read_estimated_n_total(dataset_path.with_suffix(".geff"))
+        n_total = (
+            _read_estimated_n_total(dataset_path.with_suffix(".geff"))
+            if prediction.seen_frames == set(range(dataset.image_shape[0]))
+            else float("nan")
+        )
 
         result = compute_tracking_metric(pred_graph, gt_graph, scale=dataset.scale)
         recall = (
@@ -1368,6 +1392,7 @@ def train(
             train_time = time.monotonic() - t0
 
             t0 = time.monotonic()
+            validation_predictions = {}
             validation_losses = evaluate(
                 model,
                 test_loader,
@@ -1375,15 +1400,9 @@ def train(
                 det_loss_weight=det_loss_weight,
                 det_neg_weight=det_neg_weight,
                 pool_kernel_um=pool_kernel_um,
+                predictions=validation_predictions,
             )
-            validation_metrics = evaluate_tracking_metrics(
-                model,
-                test_files,
-                device,
-                window_size=window_size,
-                downsample=downsample,
-                pool_kernel_um=pool_kernel_um,
-            )
+            validation_metrics = evaluate_tracking_metrics(validation_predictions)
             validation_time = time.monotonic() - t0
 
             score = (
