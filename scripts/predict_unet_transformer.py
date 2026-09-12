@@ -293,6 +293,139 @@ def _detect_cells_pooled(
     return np.concatenate([t_col, coords], axis=1).astype(np.int16)
 
 
+class VideoPredictionAccumulator:
+    """Assemble windows using first-seen coordinates and current-window features.
+
+    Coordinates supplied to add_window are in the downsampled grid. No image
+    inference occurs here. Call windows in increasing time order per video.
+    """
+
+    def __init__(self, downsample: tuple[int, ...]):
+        self.downsample = np.asarray(downsample, dtype=np.float32)
+        self.seen_frames: set[int] = set()
+        self.seen_pairs: set[tuple[int, int]] = set()
+        self.coord_offset: dict[int, tuple[int, int]] = {}
+        self.coord_lists: list[np.ndarray] = []
+        self.global_node_count = 0
+        self.all_edges: list[tuple[int, int, float, float]] = []
+
+    @torch.no_grad()
+    def add_window(
+        self, model: UNetNodeTransformer, unet_out: torch.Tensor,
+        frame_coords: list[np.ndarray | None], frame_indices: list[int],
+        image_shape: tuple[int, ...], *, edge_activation: str = "softmax",
+        threshold: float = 0.5, max_parents_per_node: int | None = None,
+        max_children_per_node: int | None = None,
+    ) -> None:
+        device = unet_out.device
+        W = len(frame_indices)
+        ds_arr_t = torch.as_tensor(self.downsample, device=device)
+        # Register only the first detection of each frame.
+        for f_idx, t in enumerate(frame_indices):
+            if t not in self.seen_frames:
+                arr = frame_coords[f_idx]
+                assert arr is not None
+                self.coord_offset[t] = (self.global_node_count, self.global_node_count + len(arr))
+                self.global_node_count += len(arr)
+                self.coord_lists.append(arr)
+                self.seen_frames.add(t)
+
+        coords_so_far = (
+            np.concatenate(self.coord_lists) if self.coord_lists else np.empty((0, 4), dtype=np.int16)
+        )
+
+        # --- Edge prediction for each consecutive pair in the window ---
+        for f_idx in range(W - 1):
+            t_src, t_tgt = frame_indices[f_idx], frame_indices[f_idx + 1]
+            if (t_src, t_tgt) in self.seen_pairs:
+                continue
+            self.seen_pairs.add((t_src, t_tgt))
+
+            if t_src not in self.coord_offset or t_tgt not in self.coord_offset:
+                continue
+            s_src, e_src = self.coord_offset[t_src]
+            s_tgt, e_tgt = self.coord_offset[t_tgt]
+            if e_src == s_src or e_tgt == s_tgt:
+                continue
+
+            c_src = coords_so_far[s_src:e_src]
+            c_tgt = coords_so_far[s_tgt:e_tgt]
+            n_src, n_tgt = len(c_src), len(c_tgt)
+            idx_src = np.arange(s_src, e_src, dtype=np.int64)
+            idx_tgt = np.arange(s_tgt, e_tgt, dtype=np.int64)
+
+            # Build tensors (batch_size=1).
+            p_coords_src = torch.from_numpy(c_src[:, 1:].astype(np.float32)).unsqueeze(0).to(device)
+            p_coords_tgt = torch.from_numpy(c_tgt[:, 1:].astype(np.float32)).unsqueeze(0).to(device)
+            # Use window-relative time (f_idx, f_idx+1) normalised by W, not absolute frame index.
+            window_shape = (W,) + image_shape[1:]
+            c_src_rel = c_src.copy()
+            c_src_rel[:, 0] = f_idx
+            c_tgt_rel = c_tgt.copy()
+            c_tgt_rel[:, 0] = f_idx + 1
+            p_pos_src = torch.from_numpy(extract_pos_features(c_src_rel, window_shape)).unsqueeze(0).to(device)
+            p_pos_tgt = torch.from_numpy(extract_pos_features(c_tgt_rel, window_shape)).unsqueeze(0).to(device)
+            p_mask_src = torch.ones(1, n_src, dtype=torch.bool, device=device)
+            p_mask_tgt = torch.ones(1, n_tgt, dtype=torch.bool, device=device)
+
+            unet_feat_src = model._index_features(
+                unet_out[:, f_idx], p_coords_src, p_mask_src,
+            )
+            unet_feat_tgt = model._index_features(
+                unet_out[:, f_idx + 1], p_coords_tgt, p_mask_tgt,
+            )
+            edge_logits_pair = model.predict_edges(
+                unet_feat_src, unet_feat_tgt,
+                p_coords_src * ds_arr_t, p_coords_tgt * ds_arr_t,
+                p_pos_src, p_pos_tgt,
+                p_mask_src, p_mask_tgt,
+            )  # (1, n_src, n_tgt)
+
+            raw = edge_logits_pair[0]
+            if edge_activation == "softmax":
+                probs = torch.softmax(raw, dim=0).cpu().numpy()
+            else:
+                probs = torch.sigmoid(raw).cpu().numpy()
+
+            candidates = sorted(
+                [
+                    (probs[i, j], i, j)
+                    for i in range(n_src)
+                    for j in range(n_tgt)
+                    if probs[i, j] > threshold
+                ],
+                reverse=True,
+            )
+
+            children_count: dict[int, int] = {}
+            parents_count: dict[int, int] = {}
+
+            for prob, i, j in candidates:
+                n_ch = children_count.get(i, 0)
+                n_pa = parents_count.get(j, 0)
+                if max_children_per_node is not None and n_ch >= max_children_per_node:
+                    continue
+                if max_parents_per_node is not None and n_pa >= max_parents_per_node:
+                    continue
+
+                gi, gj = int(idx_src[i]), int(idx_tgt[j])
+                dist = float(np.linalg.norm(
+                    coords_so_far[gi, 1:].astype(np.float32)
+                    - coords_so_far[gj, 1:].astype(np.float32)
+                ))
+                self.all_edges.append((gi, gj, float(prob), dist))
+                children_count[i] = n_ch + 1
+                parents_count[j] = n_pa + 1
+
+
+    def result(self) -> tuple[np.ndarray, list[tuple[int, int, float, float]]]:
+        coords = (np.concatenate(self.coord_lists) if self.coord_lists
+                  else np.empty((0, 4), dtype=np.int16))
+        coords = coords.astype(np.float32)
+        coords[:, 1:] *= self.downsample
+        return coords.astype(np.int16), list(self.all_edges)
+
+
 @torch.no_grad()
 def predict_video(
     model: UNetNodeTransformer,
@@ -327,21 +460,11 @@ def predict_video(
     image_shape = (T,) + ds.image_shape[1:]
     target_shape = list(image_shape[1:])
 
-    ds_arr = np.array(downsample, dtype=np.float32)  # for coord rescaling at the end
-    ds_arr_t = torch.from_numpy(ds_arr).to(device)   # for predict_edges (original-space coords)
-    pos_feat_dim = 4 * _POS_EMBED_DIM
     W = window_size
     voxel_size = tuple(s * d for s, d in zip(ds.scale, downsample))
     pool_k = pool_kernel_from_um(cfg.pool_kernel_um, voxel_size)
 
-    # Running node registry — each entry records the frame-t detections.
-    # coord_offset[t] = (start, end) half-open range into the stacked array.
-    seen_frames: set[int] = set()
-    seen_pairs: set[tuple[int, int]] = set()
-    coord_lists: list[np.ndarray] = []
-    coord_offset: dict[int, tuple[int, int]] = {}
-    global_node_count: int = 0
-    all_edges: list[tuple[int, int, float, float]] = []
+    accumulator = VideoPredictionAccumulator(downsample)
 
     # Sliding windows with stride W-1 cover every consecutive pair exactly once.
     stride = max(W - 1, 1)
@@ -389,112 +512,20 @@ def predict_video(
 
         del imgs
 
-        # --- Detect cells in each frame (dedup across windows) ---
-        for f_idx, t in enumerate(frame_indices):
-            if t not in seen_frames:
-                arr = _detect_cells_pooled(
-                    det_logits[f_idx][0], t, cfg.det_threshold, pool_k,
-                )
-                coord_offset[t] = (global_node_count, global_node_count + len(arr))
-                global_node_count += len(arr)
-                coord_lists.append(arr)
-                seen_frames.add(t)
-
-        coords_so_far = (
-            np.concatenate(coord_lists) if coord_lists else np.empty((0, 4), dtype=np.int16)
+        frame_coords = [
+            _detect_cells_pooled(det_logits[i][0], t, cfg.det_threshold, pool_k)
+            if t not in accumulator.seen_frames else None
+            for i, t in enumerate(frame_indices)
+        ]
+        accumulator.add_window(
+            model, unet_out, frame_coords, frame_indices, image_shape,
+            edge_activation=cfg.edge_activation, threshold=cfg.threshold,
+            max_parents_per_node=cfg.max_parents_per_node,
+            max_children_per_node=cfg.max_children_per_node,
         )
-
-        # --- Edge prediction for each consecutive pair in the window ---
-        for f_idx in range(W - 1):
-            t_src, t_tgt = frame_indices[f_idx], frame_indices[f_idx + 1]
-            if (t_src, t_tgt) in seen_pairs:
-                continue
-            seen_pairs.add((t_src, t_tgt))
-
-            if t_src not in coord_offset or t_tgt not in coord_offset:
-                continue
-            s_src, e_src = coord_offset[t_src]
-            s_tgt, e_tgt = coord_offset[t_tgt]
-            if e_src == s_src or e_tgt == s_tgt:
-                continue
-
-            c_src = coords_so_far[s_src:e_src]
-            c_tgt = coords_so_far[s_tgt:e_tgt]
-            n_src, n_tgt = len(c_src), len(c_tgt)
-            idx_src = np.arange(s_src, e_src, dtype=np.int64)
-            idx_tgt = np.arange(s_tgt, e_tgt, dtype=np.int64)
-
-            # Build tensors (batch_size=1).
-            p_coords_src = torch.from_numpy(c_src[:, 1:].astype(np.float32)).unsqueeze(0).to(device)
-            p_coords_tgt = torch.from_numpy(c_tgt[:, 1:].astype(np.float32)).unsqueeze(0).to(device)
-            # Use window-relative time (f_idx, f_idx+1) normalised by W, not absolute frame index.
-            window_shape = (W,) + image_shape[1:]
-            c_src_rel = c_src.copy()
-            c_src_rel[:, 0] = f_idx
-            c_tgt_rel = c_tgt.copy()
-            c_tgt_rel[:, 0] = f_idx + 1
-            p_pos_src = torch.from_numpy(extract_pos_features(c_src_rel, window_shape)).unsqueeze(0).to(device)
-            p_pos_tgt = torch.from_numpy(extract_pos_features(c_tgt_rel, window_shape)).unsqueeze(0).to(device)
-            p_mask_src = torch.ones(1, n_src, dtype=torch.bool, device=device)
-            p_mask_tgt = torch.ones(1, n_tgt, dtype=torch.bool, device=device)
-
-            unet_feat_src = model._index_features(
-                unet_out[:, f_idx], p_coords_src, p_mask_src,
-            )
-            unet_feat_tgt = model._index_features(
-                unet_out[:, f_idx + 1], p_coords_tgt, p_mask_tgt,
-            )
-            edge_logits_pair = model.predict_edges(
-                unet_feat_src, unet_feat_tgt,
-                p_coords_src * ds_arr_t, p_coords_tgt * ds_arr_t,
-                p_pos_src, p_pos_tgt,
-                p_mask_src, p_mask_tgt,
-            )  # (1, n_src, n_tgt)
-
-            raw = edge_logits_pair[0]
-            if cfg.edge_activation == "softmax":
-                probs = torch.softmax(raw, dim=0).cpu().numpy()
-            else:
-                probs = torch.sigmoid(raw).cpu().numpy()
-
-            candidates = sorted(
-                [
-                    (probs[i, j], i, j)
-                    for i in range(n_src)
-                    for j in range(n_tgt)
-                    if probs[i, j] > cfg.threshold
-                ],
-                reverse=True,
-            )
-
-            children_count: dict[int, int] = {}
-            parents_count: dict[int, int] = {}
-
-            for prob, i, j in candidates:
-                n_ch = children_count.get(i, 0)
-                n_pa = parents_count.get(j, 0)
-                if cfg.max_children_per_node is not None and n_ch >= cfg.max_children_per_node:
-                    continue
-                if cfg.max_parents_per_node is not None and n_pa >= cfg.max_parents_per_node:
-                    continue
-
-                gi, gj = int(idx_src[i]), int(idx_tgt[j])
-                dist = float(np.linalg.norm(
-                    coords_so_far[gi, 1:].astype(np.float32)
-                    - coords_so_far[gj, 1:].astype(np.float32)
-                ))
-                all_edges.append((gi, gj, float(prob), dist))
-                children_count[i] = n_ch + 1
-                parents_count[j] = n_pa + 1
-
         del unet_out
 
-    coords = np.concatenate(coord_lists) if coord_lists else np.empty((0, 4), dtype=np.int16)
-    # Scale spatial coords back to original resolution.
-    coords = coords.astype(np.float32)
-    coords[:, 1:] *= ds_arr
-    coords = coords.astype(np.int16)
-    return coords, all_edges
+    return accumulator.result()
 
 
 # =============================================================================
