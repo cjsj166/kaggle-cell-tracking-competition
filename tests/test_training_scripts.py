@@ -15,7 +15,7 @@ from train_unet_transformer import train, DEFAULT_AUGMENTATIONS
 from predict_unet_transformer import PredictConfig, load_model, predict_video
 from tracking_cellmot.io import open_dataset
 from tracking_cellmot.metrics import evaluate, node_recall
-from tracking_cellmot.prediction import build_graph
+from tracking_cellmot.edge_prediction import build_graph
 
 
 # 5-frame clip extracted from the full dataset: frames 26–30, division at t=2.

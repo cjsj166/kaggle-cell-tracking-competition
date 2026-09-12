@@ -8,7 +8,7 @@ import torch
 
 import predict_unet_transformer as prediction
 from tracking_cellmot.models import UNetNodeTransformer
-from tracking_cellmot.prediction import VideoPredictionAccumulator
+from tracking_cellmot.edge_prediction import VideoPredictionAccumulator
 
 
 class RecordingModel:

@@ -1,4 +1,4 @@
-"""Reusable graph assembly for temporal-window predictions."""
+"""Reusable graph assembly for temporal-window edge predictions."""
 
 import numpy as np
 import polars as pl

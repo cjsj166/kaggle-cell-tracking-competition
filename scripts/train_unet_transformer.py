@@ -44,7 +44,7 @@ from tracking_cellmot.models import (
     UNetNodeTransformer,
     extract_pos_features,
 )
-from tracking_cellmot.prediction import VideoPredictionAccumulator, build_graph
+from tracking_cellmot.edge_prediction import VideoPredictionAccumulator, build_graph
 
 from itertools import cycle as _cycle
 
@@ -1249,10 +1249,7 @@ def train(
             validation_metrics = score_tracking_predictions(validation_predictions)
             validation_time = time.monotonic() - t0
 
-            score = (
-                validation_losses.edge_accuracy
-                * validation_losses.detection_node_recall
-            )
+            score = validation_metrics["score"]
             is_best = score >= best_score
             model_state = _canonical_model_state(model)
 
@@ -1296,7 +1293,7 @@ def train(
     finally:
         writer.close()
 
-    print(f"\nBest score (acc*recall): {best_score:.4f}, saved to {save_path}")
+    print(f"\nBest competition score: {best_score:.4f}, saved to {save_path}")
     if save_path.exists():
         state = torch.load(save_path, map_location="cpu", weights_only=True)
         if isinstance(model.unet, nn.DataParallel):

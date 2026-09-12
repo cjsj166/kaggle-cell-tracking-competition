@@ -11,7 +11,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 import train_unet_transformer as training
-from tracking_cellmot.prediction import build_graph
+from tracking_cellmot.edge_prediction import build_graph
 
 
 class _ValidationModel:
@@ -131,7 +131,8 @@ def test_empty_pairs_do_not_dilute_real_validation_loss(
 
 @pytest.mark.parametrize("wrap_unet", [False, True])
 def test_resume_restores_cpu_model_and_optimizer_before_training(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, wrap_unet: bool,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    wrap_unet: bool,
 ) -> None:
     events = []
 
@@ -189,9 +190,13 @@ def test_resume_restores_cpu_model_and_optimizer_before_training(
     monkeypatch.setattr(training, "run_validation", lambda *args, **kwargs: (
         training.ValidationLosses(1.0, 2.0, 3.0, 1.0, 1.0)
     ))
-    monkeypatch.setattr(training, "score_tracking_predictions", lambda *args, **kwargs: dict.fromkeys(
-        ["score", "edge_jaccard", "adj_edge_jaccard", "division_jaccard", "total_node_ratio"], 1.0,
-    ))
+    monkeypatch.setattr(training, "score_tracking_predictions", lambda *args, **kwargs: {
+        "score": 0.25,
+        "edge_jaccard": 1.0,
+        "adj_edge_jaccard": 1.0,
+        "division_jaccard": 1.0,
+        "total_node_ratio": 1.0,
+    })
 
     model = training.train(
         data_dir=tmp_path, fold=0, splits_file=tmp_path / "unused.json",
@@ -205,6 +210,7 @@ def test_resume_restores_cpu_model_and_optimizer_before_training(
     )
     assert saved["epoch"] == 2
     assert saved["global_step"] == 8
+    assert "Best competition score: 0.2500" in capsys.readouterr().out
     for key, value in model.state_dict().items():
         torch.testing.assert_close(value, expected[key])
 

@@ -23,7 +23,7 @@ from tracking_cellmot.models import (
     POS_EMBED_DIM,
     UNetNodeTransformer,
 )
-from tracking_cellmot.prediction import VideoPredictionAccumulator, build_graph
+from tracking_cellmot.edge_prediction import VideoPredictionAccumulator, build_graph
 
 from dataspec import USERNAME, INTERACTIVE, WEIGHTS_PATH
 from evaluate import evaluate_run
