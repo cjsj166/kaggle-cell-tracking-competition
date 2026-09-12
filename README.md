@@ -94,6 +94,28 @@ Start TensorBoard so it is reachable from outside the current environment:
 uv run tensorboard --logdir runs --host 0.0.0.0
 ```
 
+#### Validate saved epochs
+
+Evaluate a contiguous range of epoch checkpoints without resuming training:
+
+```bash
+uv run python scripts/validate_epochs.py \
+    --data-dir data/train --split 0 \
+    --start-epoch 1 --through-epoch 10
+```
+
+The epoch range is inclusive. Every requested checkpoint must exist under
+`weights/<method>/split_<fold>/checkpoints/`; a missing epoch is treated as an
+error rather than silently leaving a gap in the curve. Results use the same
+`validation/` tags and epoch steps as validation performed during training and
+are written as one TensorBoard run under `runs/<method>/split_<fold>/<run-id>/`.
+Use `--run-dir` to append the scalars to a specific run instead.
+
+Pass the same `--batch-size`, `--det-loss-weight`, and `--det-neg-weight` used
+for training when they differed from the defaults. Model architecture,
+downsampling, window size, and pooling distance are restored from the saved
+`config.json`.
+
 This command trained the model released in the public [UNet baseline inference notebook](https://www.kaggle.com/code/thibautgoldsborough/unet-baseline-inference-submission). It was not trained to convergence — expect gains from training longer.
 
 ### Prediction
