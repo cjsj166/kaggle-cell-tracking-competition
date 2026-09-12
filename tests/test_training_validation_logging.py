@@ -10,8 +10,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
-import predict_unet_transformer as prediction
 import train_unet_transformer as training
+from tracking_cellmot.prediction import build_graph
 
 
 class _ValidationModel:
@@ -49,6 +49,8 @@ def test_evaluate_returns_all_three_validation_losses(
         "image_shape": torch.tensor([[2, 1, 1, 1]] * batch_size),
         "voxel_size": torch.ones(batch_size, 3),
         "downsample": torch.ones(batch_size, 3),
+        "video_id": [f"video-{i}" for i in range(batch_size)],
+        "t_start": torch.zeros(batch_size, dtype=torch.long),
     }
 
     def fake_detect_and_match(det_logits, gt_coords, mask, *args, **kwargs):
@@ -70,6 +72,7 @@ def test_evaluate_returns_all_three_validation_losses(
 
     result = training.evaluate(
         _ValidationModel(), [batch], torch.device("cpu"), det_loss_weight=0.5, det_neg_weight=0.1,
+        predictions={},
     )
 
     expected_edge_loss = 3.0 if valid_pairs else 0.0
@@ -101,6 +104,8 @@ def test_empty_pairs_do_not_dilute_real_validation_loss(
         "image_shape": torch.tensor([[2, 1, 1, 1]] * batch_size),
         "voxel_size": torch.ones(batch_size, 3),
         "downsample": torch.ones(batch_size, 3),
+        "video_id": [f"video-{i}" for i in range(batch_size)],
+        "t_start": torch.zeros(batch_size, dtype=torch.long),
     }
 
     def fake_detect_and_match(det_logits, gt_coords, mask, *args, **kwargs):
@@ -111,7 +116,10 @@ def test_empty_pairs_do_not_dilute_real_validation_loss(
 
     monkeypatch.setattr(training, "detect_and_match", fake_detect_and_match)
     monkeypatch.setattr(training, "compute_detection_loss", lambda *args: torch.tensor(2.0))
-    result = training.evaluate(_ValidationModel(), [batch], torch.device("cpu"), det_loss_weight=0.5, det_neg_weight=0.1)
+    result = training.evaluate(
+        _ValidationModel(), [batch], torch.device("cpu"),
+        det_loss_weight=0.5, det_neg_weight=0.1, predictions={},
+    )
 
     # With zero logits and two candidates, focal BCE is 0.25 * log(2).
     # Adding unannotated pairs must not divide this by (1 + empty_pairs).
@@ -208,7 +216,7 @@ def test_full_video_metrics_include_counts_and_node_ratio(
 ) -> None:
     coords = np.array([[0, 0, 0, 0], [1, 0, 0, 0]], dtype=np.int16)
     edges = [(0, 1, 0.9, 0.0)]
-    gt_graph = prediction.build_graph(coords, edges)
+    gt_graph = build_graph(coords, edges)
 
     monkeypatch.setattr(
         training,

@@ -6,12 +6,13 @@ import numpy as np
 import pytest
 import torch
 
-import predict_unet_transformer as prediction
 import train_unet_transformer as training
+from tracking_cellmot.models import UNetNodeTransformer
+from tracking_cellmot.prediction import VideoPredictionAccumulator, build_graph
 
 
 class RecordingModel:
-    _index_features = training.UNetNodeTransformer._index_features
+    _index_features = UNetNodeTransformer._index_features
 
     def __init__(self):
         self.encodes = 0
@@ -54,8 +55,10 @@ def test_evaluate_reuses_unet_and_preserves_loss_across_batches_and_movies(batch
         for offset in range(0, len(batches), batch_size)
         for group in [batches[offset:offset + batch_size]]
     ]
-    reference = training.evaluate(RecordingModel(), batches, torch.device("cpu"),
-                                  0.1, 0.01, pool_kernel_um=1.)
+    reference = training.evaluate(
+        RecordingModel(), batches, torch.device("cpu"), 0.1, 0.01,
+        pool_kernel_um=1., predictions={},
+    )
     model = RecordingModel()
     predictions = {}
     actual = training.evaluate(model, batches, torch.device("cpu"), 0.1, 0.01,
@@ -70,7 +73,7 @@ def test_evaluate_reuses_unet_and_preserves_loss_across_batches_and_movies(batch
 
 def test_metrics_exclude_unvisited_frames_and_transitions(monkeypatch):
     coords = np.array([[t, 0, 0, 0] for t in range(6)])
-    gt = prediction.build_graph(coords, [(t, t + 1, 1., 0.) for t in range(5)])
+    gt = build_graph(coords, [(t, t + 1, 1., 0.) for t in range(5)])
     # Frame 5 and pairs 1->2, 4->5 were not evaluated.
     selected = coords[:5]
     edges = [(0, 1, 1., 0.), (2, 3, 1., 0.), (3, 4, 1., 0.)]
@@ -96,12 +99,19 @@ def test_validation_requires_explicit_loss_weights():
         training.evaluate(RecordingModel(), [], torch.device("cpu"))
 
 
+def test_validation_requires_prediction_accumulator():
+    with pytest.raises(TypeError):
+        training.evaluate(
+            RecordingModel(), [], torch.device("cpu"), 0.1, 0.01,
+        )
+
+
 def test_empty_detections_keep_frame_coverage_and_gt_recall(monkeypatch):
-    acc = prediction.VideoPredictionAccumulator((1, 1, 1))
+    acc = VideoPredictionAccumulator((1, 1, 1))
     acc.add_window(RecordingModel(), torch.zeros(1, 2, 1, 1, 1, 1),
                    [np.empty((0, 4)), np.empty((0, 4))], [0, 1], (3, 1, 1, 1))
-    gt = prediction.build_graph(np.array([[t, 0, 0, 0] for t in range(3)]),
-                                [(0, 1, 1., 0.), (1, 2, 1., 0.)])
+    gt = build_graph(np.array([[t, 0, 0, 0] for t in range(3)]),
+                     [(0, 1, 1., 0.), (1, 2, 1., 0.)])
     monkeypatch.setattr(training, "open_dataset", lambda *a, **k: SimpleNamespace(
         tracks=gt, image_shape=(3, 1, 1, 1), scale=(1., 1., 1.),
     ))

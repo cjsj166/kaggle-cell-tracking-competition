@@ -39,7 +39,13 @@ from tracking_cellmot.metrics import (
     per_sample_metrics,
     summarise,
 )
-from tracking_cellmot.models import SimpleNodeTransformer, TemporalUNet3D
+from tracking_cellmot.models import (
+    POS_EMBED_DIM,
+    TemporalUNet3D,
+    UNetNodeTransformer,
+    extract_pos_features,
+)
+from tracking_cellmot.prediction import VideoPredictionAccumulator, build_graph
 
 from itertools import cycle as _cycle
 
@@ -124,7 +130,7 @@ from dataspec import RUNS_PATH, WEIGHTS_PATH
 from evaluate import _read_estimated_n_total
 
 DEFAULT_METHOD = "unet_transformer"
-_POS_EMBED_DIM = 8   # per axis; total = 4 axes × _POS_EMBED_DIM = 32
+_POS_EMBED_DIM = POS_EMBED_DIM
 
 
 # =============================================================================
@@ -178,38 +184,6 @@ class ValidationLosses:
 # =============================================================================
 # Data preparation
 # =============================================================================
-
-def extract_pos_features(
-    coords: np.ndarray,
-    image_shape: tuple[int, ...],
-    pos_embed_dim: int = _POS_EMBED_DIM,
-) -> np.ndarray:
-    """Sinusoidal positional embeddings for node coordinates (no intensity term).
-
-    Parameters
-    ----------
-    coords : np.ndarray
-        (N, 4) with columns [t, z, y, x].
-    image_shape : tuple
-        Full image shape (T, Z, Y, X) used for normalisation.
-    pos_embed_dim : int
-        Half-dimension per axis (sin half + cos half).
-
-    Returns
-    -------
-    np.ndarray
-        Shape (N, 4 * pos_embed_dim), float32.
-    """
-    t, z, y, x = coords[:, 0], coords[:, 1], coords[:, 2], coords[:, 3]
-    norms = [c / max(s, 1) for c, s in zip([t, z, y, x], image_shape)]
-
-    def _embed(vals: np.ndarray) -> np.ndarray:
-        freqs = 2 ** np.arange(pos_embed_dim // 2)
-        angles = vals[:, None] * freqs * np.pi
-        return np.concatenate([np.sin(angles), np.cos(angles)], axis=1)
-
-    return np.concatenate([_embed(n) for n in norms], axis=1).astype(np.float32)
-
 
 def get_window_data(
     gt_graph: td.graph.BaseGraph,
@@ -426,120 +400,6 @@ def load_dataset_windows(
             windows.append(data)
 
     return video_meta, windows
-
-
-# =============================================================================
-# Model
-# =============================================================================
-
-class UNetNodeTransformer(nn.Module):
-    """TemporalUNet3D encoder + SimpleNodeTransformer edge predictor.
-
-    Forward pass:
-      1. Stack frames t and t+1 → (B, 2, 1, *spatial) → UNet → (B, 2, C_feat, *spatial)
-      2. Integer-index feature maps at node coords (round + clamp; differentiable)
-      3. Concatenate with sinusoidal positional embeddings
-      4. Cross-attention transformer → (B, max_nodes, max_nodes) edge logits
-    """
-
-    def __init__(
-        self,
-        unet: nn.Module,
-        unet_out_channels: int,
-        pos_feat_dim: int,
-        hidden_dim: int = 128,
-        n_heads: int = 4,
-        n_blocks: int = 4,
-        dropout: float = 0.3,
-    ):
-        super().__init__()
-        self.unet = unet
-        self.unet_out_channels = unet_out_channels
-
-        self.detect_head = nn.Conv3d(unet_out_channels, 1, kernel_size=1)
-
-        self.transformer = SimpleNodeTransformer(
-            feat_dim=unet_out_channels + pos_feat_dim,
-            hidden_dim=hidden_dim,
-            n_heads=n_heads,
-            n_blocks=n_blocks,
-            dropout=dropout,
-        )
-
-    def _index_features(
-        self,
-        feat_maps: torch.Tensor,  # (B, C, *spatial)
-        coords: torch.Tensor,     # (B, max_nodes, 3)
-        mask: torch.Tensor,       # (B, max_nodes) bool
-    ) -> torch.Tensor:
-        """Integer-index feat_maps at node positions; padded slots → zeros.
-
-        Gradients flow through the *feature map values* but NOT through the
-        coordinates (integer indexing is non-differentiable w.r.t. position).
-        """
-        B, C = feat_maps.shape[:2]
-        spatial = feat_maps.shape[2:]
-        max_nodes = coords.shape[1]
-
-        out = torch.zeros(B, max_nodes, C, device=feat_maps.device, dtype=feat_maps.dtype)
-        for b in range(B):
-            nt = int(mask[b].sum().item())
-            if nt == 0:
-                continue
-            z = coords[b, :nt, 0].long().clamp(0, spatial[0] - 1)
-            y = coords[b, :nt, 1].long().clamp(0, spatial[1] - 1)
-            x = coords[b, :nt, 2].long().clamp(0, spatial[2] - 1)
-            out[b, :nt] = feat_maps[b, :, z, y, x].T
-        return out
-
-    def detect(
-        self,
-        frame: torch.Tensor,  # (*spatial) — single pre-downsampled frame
-    ) -> torch.Tensor:
-        """Run UNet + detection head on a single frame.
-
-        Returns
-        -------
-        torch.Tensor
-            (*spatial) detection logits at the input (already downsampled) resolution.
-        """
-        # Duplicate the frame into a fake pair so the temporal UNet can run.
-        pair = torch.stack([frame, frame], dim=0).unsqueeze(0).unsqueeze(2)  # (1, 2, 1, *spatial)
-        unet_out = self.unet(pair)          # (1, 2, C_feat, *spatial)
-        det = self.detect_head(unet_out[0, 0:1])  # (1, 1, *spatial)
-        return det[0, 0]  # (*spatial)
-
-    def encode(
-        self,
-        imgs: torch.Tensor,  # (B, W, *spatial) — already downsampled
-    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """Run UNet encoder on W pre-downsampled frames.
-
-        Returns ``(unet_out, det_logits)`` where *unet_out* is
-        ``(B, W, C_feat, *spatial)`` and *det_logits* is a list of W
-        tensors each ``(B, 1, *spatial)``.
-        """
-        window = imgs.unsqueeze(2)  # (B, W, 1, *spatial)
-        unet_out = self.unet(window)  # (B, W, C_feat, *spatial)
-        W = unet_out.shape[1]
-        det_logits = [self.detect_head(unet_out[:, i]) for i in range(W)]
-        return unet_out, det_logits
-
-    def predict_edges(
-        self,
-        unet_feat_src: torch.Tensor,  # (B, N_src, C_feat) pre-indexed
-        unet_feat_tgt: torch.Tensor,  # (B, N_tgt, C_feat) pre-indexed
-        coords_src: torch.Tensor,     # (B, N_src, 3)
-        coords_tgt: torch.Tensor,     # (B, N_tgt, 3)
-        pos_feat_src: torch.Tensor,   # (B, N_src, pos_feat_dim)
-        pos_feat_tgt: torch.Tensor,   # (B, N_tgt, pos_feat_dim)
-        mask_src: torch.Tensor,       # (B, N_src) bool
-        mask_tgt: torch.Tensor,       # (B, N_tgt) bool
-    ) -> torch.Tensor:
-        """Run transformer edge predictor on pre-indexed UNet features."""
-        feat_src = torch.cat([unet_feat_src, pos_feat_src], dim=-1)
-        feat_tgt = torch.cat([unet_feat_tgt, pos_feat_tgt], dim=-1)
-        return self.transformer(feat_src, feat_tgt, coords_src, coords_tgt, mask_src, mask_tgt)
 
 
 # =============================================================================
@@ -957,18 +817,15 @@ def evaluate(
     det_neg_weight: float,
     pool_kernel_um: float = 5.0,
     *,
-    predictions: dict | None = None,
+    predictions: dict[str, VideoPredictionAccumulator],
 ) -> ValidationLosses:
     """Evaluate model using detect→match→predict (same path as training).
 
     Returns all three validation losses (edge, detection, combined), plus the
     inexpensive window-level edge accuracy and detection recall diagnostics.
-    If predictions is supplied, also collect movie graphs from these windows
-    without a second UNet pass. The loader must be ordered by time per video.
+    Movie graphs are collected from the same UNet pass. The loader must be
+    ordered by time per video.
     """
-    # Prediction imports this module's model, so defer this circular import.
-    from predict_unet_transformer import VideoPredictionAccumulator
-
     model.eval()
     total_edge_loss, total_det_loss = 0.0, 0.0
     correct, total, n_pairs, n_samples = 0, 0, 0, 0
@@ -1017,24 +874,23 @@ def evaluate(
                 gt_total += n_gt
                 gt_matched += n_matched
 
-        if predictions is not None:
-            for b in range(B):
-                video_id = batch["video_id"][b]
-                if video_id not in predictions:
-                    predictions[video_id] = VideoPredictionAccumulator(
-                        batch["downsample"][b].tolist(),
-                    )
-                t_start = int(batch["t_start"][b])
-                frame_indices = list(range(t_start, t_start + W))
-                frame_coords = []
-                for i, t in enumerate(frame_indices):
-                    n = int(frame_det[i][2][b].sum())
-                    xyz = frame_det[i][0][b, :n].cpu().numpy()
-                    frame_coords.append(np.column_stack((np.full(n, t), xyz)))
-                predictions[video_id].add_window(
-                    model, unet_out[b:b + 1], frame_coords, frame_indices,
-                    tuple(batch["image_shape"][b].tolist()),
+        for b in range(B):
+            video_id = batch["video_id"][b]
+            if video_id not in predictions:
+                predictions[video_id] = VideoPredictionAccumulator(
+                    batch["downsample"][b].tolist(),
                 )
+            t_start = int(batch["t_start"][b])
+            frame_indices = list(range(t_start, t_start + W))
+            frame_coords = []
+            for i, t in enumerate(frame_indices):
+                n = int(frame_det[i][2][b].sum())
+                xyz = frame_det[i][0][b, :n].cpu().numpy()
+                frame_coords.append(np.column_stack((np.full(n, t), xyz)))
+            predictions[video_id].add_window(
+                model, unet_out[b:b + 1], frame_coords, frame_indices,
+                tuple(batch["image_shape"][b].tolist()),
+            )
 
         # Per-pair evaluation.
         for i in range(W - 1):
@@ -1077,15 +933,13 @@ def evaluate(
 
 @torch.no_grad()
 def evaluate_tracking_metrics(
-    predictions: dict,
+    predictions: dict[str, VideoPredictionAccumulator],
 ) -> dict[str, float]:
     """Score collected graphs only on frames and transitions the loader visited.
 
     Whole-movie node estimates cannot calibrate a partial-movie prediction;
     adjusted metrics are undefined for those movies (no proportional guess).
     """
-    # Prediction imports the model from this module; defer to avoid a circular import.
-    from predict_unet_transformer import build_graph
     rows: list[dict] = []
 
     for video_id, prediction in predictions.items():

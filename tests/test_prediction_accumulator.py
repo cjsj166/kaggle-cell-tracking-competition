@@ -7,11 +7,12 @@ import pytest
 import torch
 
 import predict_unet_transformer as prediction
-import train_unet_transformer as training
+from tracking_cellmot.models import UNetNodeTransformer
+from tracking_cellmot.prediction import VideoPredictionAccumulator
 
 
 class RecordingModel:
-    _index_features = training.UNetNodeTransformer._index_features
+    _index_features = UNetNodeTransformer._index_features
 
     def __init__(self):
         self.encodes = 0
@@ -32,7 +33,7 @@ class RecordingModel:
 
 def test_accumulator_keeps_first_coordinates_but_uses_current_features():
     model = RecordingModel()
-    acc = prediction.VideoPredictionAccumulator((1, 1, 2))
+    acc = VideoPredictionAccumulator((1, 1, 2))
     first = [np.array([[0, 0, 0, 0]]), np.array([[1, 0, 0, 1]])]
     second = [np.array([[1, 0, 0, 2]]), np.array([[2, 0, 0, 2]])]
     acc.add_window(model, torch.zeros(1, 2, 1, 1, 1, 3), first, [0, 1], (3, 1, 1, 3))
@@ -65,7 +66,7 @@ def test_predict_video_and_shared_window_assembly_agree(monkeypatch, window_size
         RecordingModel(), "unused", torch.device("cpu"), cfg,
         window_size=window_size, downsample=(1, 1, 1),
     )
-    acc = prediction.VideoPredictionAccumulator((1, 1, 1))
+    acc = VideoPredictionAccumulator((1, 1, 1))
     model = RecordingModel()
     for start in range(4 - window_size + 1):
         imgs = (frames[start:start + window_size] / (1. + 1e-6)).clamp(0.).unsqueeze(0)
