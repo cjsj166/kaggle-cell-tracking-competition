@@ -16,6 +16,7 @@ import argparse
 import json
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -24,13 +25,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import zarr
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 import tracksdata as td
 
 from tracking_cellmot.io import invert_time_graph, open_dataset
-from tracking_cellmot.models import SimpleNodeTransformer, TemporalUNet3D
+from tracking_cellmot.metrics import (
+    COUNT_COLUMNS,
+    evaluate as compute_tracking_metric,
+    node_recall,
+    per_sample_metrics,
+    summarise,
+)
+from tracking_cellmot.models import (
+    POS_EMBED_DIM,
+    UNetNodeTransformer,
+    extract_pos_features,
+)
+from tracking_cellmot.edge_prediction import VideoPredictionAccumulator, build_graph
 
 from itertools import cycle as _cycle
 
@@ -111,12 +125,10 @@ def _evaluate_pair(
 from augmentations import brightness_augment, flip_augment
 
 DEFAULT_AUGMENTATIONS = [brightness_augment, flip_augment]
-from dataspec import WEIGHTS_PATH
+from dataspec import RUNS_PATH, WEIGHTS_PATH
+from evaluate import _read_estimated_n_total
 
 DEFAULT_METHOD = "unet_transformer"
-_POS_EMBED_DIM = 8   # per axis; total = 4 axes × _POS_EMBED_DIM = 32
-
-
 # =============================================================================
 # Data structures
 # =============================================================================
@@ -154,41 +166,20 @@ class VideoMeta:
     q_high: float                 # 99.9% quantile for normalization
 
 
+@dataclass(frozen=True)
+class ValidationLosses:
+    """Losses and lightweight diagnostics computed from validation windows."""
+
+    edge_loss: float
+    det_loss: float
+    loss: float
+    edge_accuracy: float
+    detection_node_recall: float
+
+
 # =============================================================================
 # Data preparation
 # =============================================================================
-
-def extract_pos_features(
-    coords: np.ndarray,
-    image_shape: tuple[int, ...],
-    pos_embed_dim: int = _POS_EMBED_DIM,
-) -> np.ndarray:
-    """Sinusoidal positional embeddings for node coordinates (no intensity term).
-
-    Parameters
-    ----------
-    coords : np.ndarray
-        (N, 4) with columns [t, z, y, x].
-    image_shape : tuple
-        Full image shape (T, Z, Y, X) used for normalisation.
-    pos_embed_dim : int
-        Half-dimension per axis (sin half + cos half).
-
-    Returns
-    -------
-    np.ndarray
-        Shape (N, 4 * pos_embed_dim), float32.
-    """
-    t, z, y, x = coords[:, 0], coords[:, 1], coords[:, 2], coords[:, 3]
-    norms = [c / max(s, 1) for c, s in zip([t, z, y, x], image_shape)]
-
-    def _embed(vals: np.ndarray) -> np.ndarray:
-        freqs = 2 ** np.arange(pos_embed_dim // 2)
-        angles = vals[:, None] * freqs * np.pi
-        return np.concatenate([np.sin(angles), np.cos(angles)], axis=1)
-
-    return np.concatenate([_embed(n) for n in norms], axis=1).astype(np.float32)
-
 
 def get_window_data(
     gt_graph: td.graph.BaseGraph,
@@ -348,6 +339,7 @@ class FrameWindowDataset(Dataset):
 
         return {
             **meta,
+            "video_id": str(vm.zarr_path),
             "imgs": imgs.half(),  # (W, *spatial)
             "image_shape": torch.tensor(vm.image_shape, dtype=torch.long),
             "voxel_size": torch.tensor(vm.voxel_size, dtype=torch.float32),
@@ -404,120 +396,6 @@ def load_dataset_windows(
             windows.append(data)
 
     return video_meta, windows
-
-
-# =============================================================================
-# Model
-# =============================================================================
-
-class UNetNodeTransformer(nn.Module):
-    """TemporalUNet3D encoder + SimpleNodeTransformer edge predictor.
-
-    Forward pass:
-      1. Stack frames t and t+1 → (B, 2, 1, *spatial) → UNet → (B, 2, C_feat, *spatial)
-      2. Integer-index feature maps at node coords (round + clamp; differentiable)
-      3. Concatenate with sinusoidal positional embeddings
-      4. Cross-attention transformer → (B, max_nodes, max_nodes) edge logits
-    """
-
-    def __init__(
-        self,
-        unet: nn.Module,
-        unet_out_channels: int,
-        pos_feat_dim: int,
-        hidden_dim: int = 128,
-        n_heads: int = 4,
-        n_blocks: int = 4,
-        dropout: float = 0.3,
-    ):
-        super().__init__()
-        self.unet = unet
-        self.unet_out_channels = unet_out_channels
-
-        self.detect_head = nn.Conv3d(unet_out_channels, 1, kernel_size=1)
-
-        self.transformer = SimpleNodeTransformer(
-            feat_dim=unet_out_channels + pos_feat_dim,
-            hidden_dim=hidden_dim,
-            n_heads=n_heads,
-            n_blocks=n_blocks,
-            dropout=dropout,
-        )
-
-    def _index_features(
-        self,
-        feat_maps: torch.Tensor,  # (B, C, *spatial)
-        coords: torch.Tensor,     # (B, max_nodes, 3)
-        mask: torch.Tensor,       # (B, max_nodes) bool
-    ) -> torch.Tensor:
-        """Integer-index feat_maps at node positions; padded slots → zeros.
-
-        Gradients flow through the *feature map values* but NOT through the
-        coordinates (integer indexing is non-differentiable w.r.t. position).
-        """
-        B, C = feat_maps.shape[:2]
-        spatial = feat_maps.shape[2:]
-        max_nodes = coords.shape[1]
-
-        out = torch.zeros(B, max_nodes, C, device=feat_maps.device, dtype=feat_maps.dtype)
-        for b in range(B):
-            nt = int(mask[b].sum().item())
-            if nt == 0:
-                continue
-            z = coords[b, :nt, 0].long().clamp(0, spatial[0] - 1)
-            y = coords[b, :nt, 1].long().clamp(0, spatial[1] - 1)
-            x = coords[b, :nt, 2].long().clamp(0, spatial[2] - 1)
-            out[b, :nt] = feat_maps[b, :, z, y, x].T
-        return out
-
-    def detect(
-        self,
-        frame: torch.Tensor,  # (*spatial) — single pre-downsampled frame
-    ) -> torch.Tensor:
-        """Run UNet + detection head on a single frame.
-
-        Returns
-        -------
-        torch.Tensor
-            (*spatial) detection logits at the input (already downsampled) resolution.
-        """
-        # Duplicate the frame into a fake pair so the temporal UNet can run.
-        pair = torch.stack([frame, frame], dim=0).unsqueeze(0).unsqueeze(2)  # (1, 2, 1, *spatial)
-        unet_out = self.unet(pair)          # (1, 2, C_feat, *spatial)
-        det = self.detect_head(unet_out[0, 0:1])  # (1, 1, *spatial)
-        return det[0, 0]  # (*spatial)
-
-    def encode(
-        self,
-        imgs: torch.Tensor,  # (B, W, *spatial) — already downsampled
-    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """Run UNet encoder on W pre-downsampled frames.
-
-        Returns ``(unet_out, det_logits)`` where *unet_out* is
-        ``(B, W, C_feat, *spatial)`` and *det_logits* is a list of W
-        tensors each ``(B, 1, *spatial)``.
-        """
-        window = imgs.unsqueeze(2)  # (B, W, 1, *spatial)
-        unet_out = self.unet(window)  # (B, W, C_feat, *spatial)
-        W = unet_out.shape[1]
-        det_logits = [self.detect_head(unet_out[:, i]) for i in range(W)]
-        return unet_out, det_logits
-
-    def predict_edges(
-        self,
-        unet_feat_src: torch.Tensor,  # (B, N_src, C_feat) pre-indexed
-        unet_feat_tgt: torch.Tensor,  # (B, N_tgt, C_feat) pre-indexed
-        coords_src: torch.Tensor,     # (B, N_src, 3)
-        coords_tgt: torch.Tensor,     # (B, N_tgt, 3)
-        pos_feat_src: torch.Tensor,   # (B, N_src, pos_feat_dim)
-        pos_feat_tgt: torch.Tensor,   # (B, N_tgt, pos_feat_dim)
-        mask_src: torch.Tensor,       # (B, N_src) bool
-        mask_tgt: torch.Tensor,       # (B, N_tgt) bool
-    ) -> torch.Tensor:
-        """Run transformer edge predictor on pre-indexed UNet features."""
-        feat_src = torch.cat([unet_feat_src, pos_feat_src], dim=-1)
-        feat_tgt = torch.cat([unet_feat_tgt, pos_feat_tgt], dim=-1)
-        return self.transformer(feat_src, feat_tgt, coords_src, coords_tgt, mask_src, mask_tgt)
 
 
 # =============================================================================
@@ -594,7 +472,7 @@ def compute_detection_loss(
 def _pos_embed_torch(
     coords: torch.Tensor,
     image_shape: tuple[int, ...],
-    pos_embed_dim: int = _POS_EMBED_DIM,
+    pos_embed_dim: int = POS_EMBED_DIM,
 ) -> torch.Tensor:
     """Batched sinusoidal positional embeddings (pure torch, stays on device).
 
@@ -651,7 +529,7 @@ def detect_and_match(
     Returns
     -------
     coords : (B, M, 3)  detected coordinates (downsampled).
-    pos    : (B, M, 4*_POS_EMBED_DIM)  positional embeddings.
+    pos    : (B, M, 4*POS_EMBED_DIM)  positional embeddings.
     mask   : (B, M)  bool.
     matches : list[Tensor]  per-sample match arrays.
     """
@@ -788,8 +666,10 @@ def train_epoch(
     det_neg_weight: float = 0.1,
     max_iters: int | None = None,
     pool_kernel_um: float = 5.0,
-) -> tuple[float, float]:
-    """Train for one epoch, return (avg edge loss, avg detection loss).
+    writer: SummaryWriter | None = None,
+    global_step: int = 0,
+) -> tuple[float, float, int]:
+    """Train for one epoch and log each optimizer step's losses.
 
     ``max_iters`` is a smoke-test-only override for exercising the training
     pipeline quickly. When set, the loader is cycled until that many iterations
@@ -892,6 +772,12 @@ def train_epoch(
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
+        if writer is not None:
+            writer.add_scalar("train/edge_loss", edge_loss.item(), global_step)
+            writer.add_scalar("train/det_loss", det_loss.item(), global_step)
+            writer.add_scalar("train/loss", loss.item(), global_step)
+        global_step += 1
+
         torch.cuda.synchronize()
         t3 = time.perf_counter()
         t_backward += t3 - t2
@@ -914,22 +800,31 @@ def train_epoch(
     return (
         total_edge_loss / max(n_samples, 1),
         total_det_loss / max(n_samples, 1),
+        global_step,
     )
 
 
 @torch.no_grad()
-def evaluate(
+def run_validation(
     model: UNetNodeTransformer,
     loader: DataLoader,
     device: torch.device,
+    det_loss_weight: float,
+    det_neg_weight: float,
     pool_kernel_um: float = 5.0,
-) -> tuple[float, float, float]:
+    *,
+    predictions: dict[str, VideoPredictionAccumulator],
+) -> ValidationLosses:
     """Evaluate model using detect→match→predict (same path as training).
 
-    Returns (avg_loss, accuracy, node_recall).
+    Returns all three validation losses (edge, detection, combined), plus the
+    inexpensive window-level edge accuracy and detection recall diagnostics.
+    Movie graphs are collected from the same UNet pass. The loader must be
+    ordered by time per video.
     """
     model.eval()
-    total_loss, correct, total, n_pairs = 0.0, 0, 0, 0
+    total_edge_loss, total_det_loss = 0.0, 0.0
+    correct, total, n_pairs, n_samples = 0, 0, 0, 0
     gt_matched, gt_total = 0, 0
 
     for batch in loader:
@@ -944,6 +839,15 @@ def evaluate(
 
         B, W = imgs.shape[:2]
         unet_out, det_logits = model.encode(imgs)
+        det_loss = sum(
+            compute_detection_loss(
+                det_logits[i], coords[:, i], masks[:, i], det_neg_weight,
+            )
+            for i in range(W)
+        ) / W
+        total_det_loss += det_loss.item() * B
+        n_samples += B
+
         frame_det: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor,
                               list[torch.Tensor], torch.Tensor]] = []
         for i in range(W):
@@ -966,6 +870,24 @@ def evaluate(
                 gt_total += n_gt
                 gt_matched += n_matched
 
+        for b in range(B):
+            video_id = batch["video_id"][b]
+            if video_id not in predictions:
+                predictions[video_id] = VideoPredictionAccumulator(
+                    batch["downsample"][b].tolist(),
+                )
+            t_start = int(batch["t_start"][b])
+            frame_indices = list(range(t_start, t_start + W))
+            frame_coords = []
+            for i, t in enumerate(frame_indices):
+                n = int(frame_det[i][2][b].sum())
+                xyz = frame_det[i][0][b, :n].cpu().numpy()
+                frame_coords.append(np.column_stack((np.full(n, t), xyz)))
+            predictions[video_id].add_window(
+                model, unet_out[b:b + 1], frame_coords, frame_indices,
+                tuple(batch["image_shape"][b].tolist()),
+            )
+
         # Per-pair evaluation.
         for i in range(W - 1):
             ns = frame_det[i][0].shape[1]
@@ -987,13 +909,117 @@ def evaluate(
                 pair_loss, pair_correct, pair_total = _evaluate_pair(
                     pair_logits[b, :ns_b, :nt_b], pair_target[b, :ns_b, :nt_b],
                 )
-                total_loss += pair_loss
+                if pair_total == 0:
+                    continue
+                total_edge_loss += pair_loss
                 correct += pair_correct
                 total += pair_total
                 n_pairs += 1
 
-    node_recall = gt_matched / max(gt_total, 1)
-    return total_loss / max(n_pairs, 1), correct / max(total, 1), node_recall
+    edge_loss = total_edge_loss / max(n_pairs, 1)
+    det_loss = total_det_loss / max(n_samples, 1)
+    return ValidationLosses(
+        edge_loss=edge_loss,
+        det_loss=det_loss,
+        loss=edge_loss + det_loss_weight * det_loss,
+        edge_accuracy=correct / max(total, 1),
+        detection_node_recall=gt_matched / max(gt_total, 1),
+    )
+
+
+@torch.no_grad()
+def score_tracking_predictions(
+    predictions: dict[str, VideoPredictionAccumulator],
+) -> dict[str, float]:
+    """Score collected graphs only on frames and transitions the loader visited.
+
+    Whole-movie node estimates cannot calibrate a partial-movie prediction;
+    adjusted metrics are undefined for those movies (no proportional guess).
+    """
+    rows: list[dict] = []
+
+    for video_id, prediction in predictions.items():
+        dataset_path = Path(video_id)
+        coords, edges = prediction.result()
+        pred_graph = build_graph(coords, edges)
+        dataset = open_dataset(dataset_path, require_tracks=True, load_image=False)
+        gt_graph = dataset.tracks
+        assert gt_graph is not None
+        gt_graph = gt_graph.filter(
+            td.NodeAttr("t").is_in(sorted(prediction.seen_frames)),
+        ).subgraph()
+        # A gap between visited windows can leave adjacent retained frames
+        # whose connecting pair was never evaluated. Exclude that GT edge too.
+        node_times = dict(gt_graph.node_attrs(attr_keys=["node_id", "t"]).iter_rows())
+        edge_attrs = gt_graph.edge_attrs(attr_keys=["edge_id", "source_id", "target_id"])
+        valid_edges = [eid for eid, src, tgt in edge_attrs.iter_rows()
+                       if (node_times[src], node_times[tgt]) in prediction.seen_pairs]
+        gt_graph = gt_graph.filter(td.EdgeAttr("edge_id").is_in(valid_edges)).subgraph()
+
+        n_total = (
+            _read_estimated_n_total(dataset_path.with_suffix(".geff"))
+            if prediction.seen_frames == set(range(dataset.image_shape[0]))
+            else float("nan")
+        )
+
+        result = compute_tracking_metric(pred_graph, gt_graph, scale=dataset.scale)
+        recall = (
+            node_recall(pred_graph, gt_graph)
+            if pred_graph.num_nodes() > 0 and pred_graph.num_edges() > 0
+            else 0.0
+        )
+        row = per_sample_metrics(result, n_total, recall)
+        row["estimated_num_nodes"] = n_total
+        rows.append(row)
+
+    summary = summarise(rows)
+    totals = {
+        name: float(sum(row[name] for row in rows))
+        for name in COUNT_COLUMNS
+    }
+    estimated_num_nodes = sum(row["estimated_num_nodes"] for row in rows)
+    estimated_pred_nodes = totals["num_pred_nodes"]
+    if estimated_num_nodes > 0:
+        total_node_ratio = (
+            estimated_pred_nodes - estimated_num_nodes
+        ) / estimated_num_nodes
+    else:
+        total_node_ratio = float("nan")
+
+    return {
+        **{name: float(value) for name, value in summary.items()},
+        **totals,
+        "estimated_num_nodes": float(estimated_num_nodes),
+        "total_node_ratio": total_node_ratio,
+    }
+
+
+def log_validation_to_tensorboard(
+    writer: SummaryWriter,
+    losses: ValidationLosses,
+    metrics: dict[str, float],
+    epoch: int,
+) -> None:
+    """Write all validation losses and tracking metrics for one epoch."""
+    writer.add_scalar("validation/edge_loss", losses.edge_loss, epoch)
+    writer.add_scalar("validation/det_loss", losses.det_loss, epoch)
+    writer.add_scalar("validation/loss", losses.loss, epoch)
+    writer.add_scalar("validation/edge_accuracy", losses.edge_accuracy, epoch)
+    writer.add_scalar(
+        "validation/detection_node_recall",
+        losses.detection_node_recall,
+        epoch,
+    )
+    for name, value in metrics.items():
+        writer.add_scalar(f"validation/{name}", value, epoch)
+
+
+def _canonical_model_state(model: UNetNodeTransformer) -> dict[str, torch.Tensor]:
+    """Return a state dict that loads without a DataParallel wrapper."""
+    return {
+        key.replace("unet.module.", "unet.", 1): value
+        for key, value in model.state_dict().items()
+    }
 
 
 # =============================================================================
@@ -1023,6 +1049,7 @@ def train(
     augmentations: list | None = DEFAULT_AUGMENTATIONS,
     pool_kernel_um: float = 5.0,
     data_parallel: bool = True,
+    resume: Path | None = None,
     max_datasets: int | None = None,
 ) -> UNetNodeTransformer:
     """Train on one fold from a pre-computed splits file.
@@ -1040,7 +1067,7 @@ def train(
 
     if debug_video is not None:
         train_files = test_files = [debug_video]
-        print(f"Debug mode: using single video {debug_video.name}", flush=True)
+        print(f"Debug mode: using single video {debug_video.name}")
     else:
         if splits_file.exists():
             folds = json.loads(splits_file.read_text())
@@ -1057,11 +1084,11 @@ def train(
             n_val = max(1, len(stems) // 10)
             folds = [{"split": 0, "train": stems[n_val:], "test": stems[:n_val]}]
             print(f"No splits file at {splits_file}; generated seed-0 split "
-                  f"({len(stems) - n_val} train / {n_val} val).", flush=True)
+                  f"({len(stems) - n_val} train / {n_val} val).")
         fold_data = folds[fold]
         train_files = [data_dir / name for name in fold_data["train"]]
         test_files = [data_dir / name for name in fold_data["test"]]
-        print(f"Fold {fold}: {len(train_files)} train, {len(test_files)} test", flush=True)
+        print(f"Fold {fold}: {len(train_files)} train, {len(test_files)} test")
 
     if max_datasets is not None:
         train_files = train_files[:max_datasets]
@@ -1083,7 +1110,7 @@ def train(
     def _load(
         files: list[Path], desc: str,
     ) -> list[tuple[VideoMeta, list[FrameWindowData]]]:
-        print(f"Loading {desc} ({len(files)} datasets)...", flush=True)
+        print(f"Loading {desc} ({len(files)} datasets)...")
         data: list[tuple[VideoMeta, list[FrameWindowData]]] = []
         for f in tqdm(files, desc=desc, disable=False):
             video_meta, windows = load_dataset_windows(
@@ -1093,7 +1120,7 @@ def train(
             )
             data.append((video_meta, windows))
         n_windows = sum(len(w) for _, w in data)
-        print(f"  {desc} done: {n_windows} windows total", flush=True)
+        print(f"  {desc} done: {n_windows} windows total")
         return data
 
     train_video_data = _load(train_files, "train")
@@ -1102,9 +1129,9 @@ def train(
     # Compute consistent max_nodes across train + test.
     all_windows = [w for _, ws in train_video_data + test_video_data for w in ws]
     max_nodes = max(max(w.node_counts) for w in all_windows)
-    print(f"max_nodes={max_nodes}", flush=True)
+    print(f"max_nodes={max_nodes}")
 
-    pos_feat_dim = 4 * _POS_EMBED_DIM
+    pos_feat_dim = 4 * POS_EMBED_DIM
 
     train_ds = FrameWindowDataset(train_video_data, max_nodes=max_nodes, augmentations=augmentations)
     test_ds = FrameWindowDataset(test_video_data, max_nodes=max_nodes)
@@ -1133,23 +1160,25 @@ def train(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     n_visible = torch.cuda.device_count() if device.type == "cuda" else 0
-    print(f"Using device: {device} | visible CUDA GPUs: {n_visible}", flush=True)
+    print(f"Using device: {device} | visible CUDA GPUs: {n_visible}")
 
-    unet = TemporalUNet3D(
-        in_channels=1,
-        out_channels=unet_out_channels,
-        layers=unet_layers,
+    model = UNetNodeTransformer(
+        unet_out_channels=unet_out_channels,
+        unet_layers=unet_layers,
+        pos_feat_dim=pos_feat_dim,
     )
     if unet_weights is not None:
         state = torch.load(unet_weights, map_location="cpu", weights_only=True)
-        missing, unexpected = unet.load_state_dict(state, strict=False)
-        print(f"  UNet weights: {len(missing)} missing, {len(unexpected)} unexpected", flush=True)
+        missing, unexpected = model.unet.load_state_dict(state, strict=False)
+        print(f"  UNet weights: {len(missing)} missing, {len(unexpected)} unexpected")
 
-    model = UNetNodeTransformer(
-        unet=unet,
-        unet_out_channels=unet_out_channels,
-        pos_feat_dim=pos_feat_dim,
-    ).to(device)
+    checkpoint = None
+    if resume is not None:
+        checkpoint = torch.load(resume, map_location="cpu", weights_only=True)
+        if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
+            raise ValueError(f"Not a training checkpoint: {resume}")
+        model.load_state_dict(checkpoint["model_state_dict"])
+    model.to(device)
 
     # Simple multi-GPU: split the heavy UNet pass across all visible GPUs.
     # Only the UNet is wrapped (it takes/returns plain batched tensors); the
@@ -1160,65 +1189,118 @@ def train(
         print(
             f"DataParallel: UNet split across {n_visible} GPUs "
             f"(effective per-GPU batch {max(1, batch_size // n_visible)})",
-            flush=True,
         )
     elif device.type == "cuda":
         reason = "--single-gpu set" if not data_parallel else f"only {n_visible} GPU visible"
-        print(f"Single-GPU training ({reason}). For 2 GPUs set the Kaggle accelerator to 'GPU T4 x2'.", flush=True)
+        print(f"Single-GPU training ({reason}). For 2 GPUs set the Kaggle accelerator to 'GPU T4 x2'.")
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model parameters: {n_params:,}", flush=True)
+    print(f"Model parameters: {n_params:,}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    print(f"Starting training for {n_epochs} epochs (batch_size={batch_size})...", flush=True)
-
+    start_epoch = 0
+    global_step = 0
     best_score = 0.0
     save_path = output_dir / "edge_predictor_best.pth"
-    pbar = tqdm(range(n_epochs), desc="Training", disable=False)
-    print(f"Detection loss: weight={det_loss_weight}, neg_weight={det_neg_weight}", flush=True)
+    checkpoint_dir = output_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = RUNS_PATH / method / f"split_{fold}" / datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    for epoch in pbar:
-        t0 = time.monotonic()
-        edge_loss, det_loss = train_epoch(
-            model, train_loader, optimizer, device, det_loss_weight, det_neg_weight,
-            max_iters=max_iters, pool_kernel_um=pool_kernel_um,
+    if checkpoint is not None:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_epoch = int(checkpoint["epoch"])
+        global_step = int(checkpoint.get("global_step", 0))
+        print(
+            f"Resumed {resume}: completed_epochs={start_epoch}, "
+            f"global_step={global_step}",
         )
-        train_time = time.monotonic() - t0
+        del checkpoint
 
-        t0 = time.monotonic()
-        test_loss, test_acc, test_recall = evaluate(model, test_loader, device, pool_kernel_um=pool_kernel_um)
-        test_time = time.monotonic() - t0
+    print(
+        f"Starting training at epoch {start_epoch + 1} of {n_epochs} "
+        f"(batch_size={batch_size})...",
+    )
+    writer = SummaryWriter(log_dir=str(run_dir))
+    print(f"TensorBoard logs: {run_dir}")
+    pbar = tqdm(range(start_epoch, n_epochs), desc="Training", disable=False)
+    print(f"Detection loss: weight={det_loss_weight}, neg_weight={det_neg_weight}")
 
-        score = test_acc * test_recall
-        is_best = score >= best_score
+    try:
+        for epoch in pbar:
+            t0 = time.monotonic()
+            edge_loss, det_loss, global_step = train_epoch(
+                model, train_loader, optimizer, device, det_loss_weight, det_neg_weight,
+                max_iters=max_iters, pool_kernel_um=pool_kernel_um,
+                writer=writer, global_step=global_step,
+            )
+            train_time = time.monotonic() - t0
 
-        if is_best:
-            best_score = score
-            # Normalise any DataParallel "unet.module." prefix to "unet." so the
-            # checkpoint loads on a single GPU (e.g. in the prediction script).
+            t0 = time.monotonic()
+            validation_predictions = {}
+            validation_losses = run_validation(
+                model,
+                test_loader,
+                device,
+                det_loss_weight=det_loss_weight,
+                det_neg_weight=det_neg_weight,
+                pool_kernel_um=pool_kernel_um,
+                predictions=validation_predictions,
+            )
+            validation_metrics = score_tracking_predictions(validation_predictions)
+            validation_time = time.monotonic() - t0
+
+            score = validation_metrics["score"]
+            is_best = score >= best_score
+            model_state = _canonical_model_state(model)
+
+            if is_best:
+                best_score = score
+                torch.save(model_state, save_path)
+
+            epoch_number = epoch + 1
+            checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch_number:04d}.pth"
             torch.save(
-                {k.replace("unet.module.", "unet.", 1): v for k, v in model.state_dict().items()},
-                save_path,
+                {
+                    "format_version": 1,
+                    "epoch": epoch_number,
+                    "global_step": global_step,
+                    "model_state_dict": model_state,
+                    "optimizer_state_dict": optimizer.state_dict(),
+                },
+                checkpoint_path,
+            )
+            log_validation_to_tensorboard(
+                writer, validation_losses, validation_metrics, epoch_number,
             )
 
-        marker = "*" if is_best else " "
-        pbar.set_postfix(edge=f"{edge_loss:.4f}", det=f"{det_loss:.4f}", acc=f"{test_acc:.4f}")
-        print(
-            f"  Epoch {epoch:3d}/{n_epochs} | edge={edge_loss:.4f} | det={det_loss:.4f} | "
-            f"test_loss={test_loss:.4f} | acc={test_acc:.4f} | recall={test_recall:.4f} | best={best_score:.4f} {marker} | "
-            f"train={train_time:.1f}s test={test_time:.1f}s",
-            flush=True,
-        )
+            marker = "*" if is_best else " "
+            pbar.set_postfix(
+                edge=f"{edge_loss:.4f}",
+                det=f"{det_loss:.4f}",
+                val_score=f"{validation_metrics['score']:.4f}",
+            )
+            print(
+                f"  Epoch {epoch_number:3d}/{n_epochs} | edge={edge_loss:.4f} | det={det_loss:.4f} | "
+                f"val_loss={validation_losses.loss:.4f} | "
+                f"edge_jaccard={validation_metrics['edge_jaccard']:.4f} | "
+                f"adj_edge_jaccard={validation_metrics['adj_edge_jaccard']:.4f} | "
+                f"division_jaccard={validation_metrics['division_jaccard']:.4f} | "
+                f"total_node_ratio={validation_metrics['total_node_ratio']:+.4f} | "
+                f"best={best_score:.4f} {marker} | train={train_time:.1f}s "
+                f"validation={validation_time:.1f}s | "
+                f"checkpoint={checkpoint_path}",
+            )
+    finally:
+        writer.close()
 
-    print(f"\nBest score (acc*recall): {best_score:.4f}, saved to {save_path}", flush=True)
+    print(f"\nBest competition score: {best_score:.4f}, saved to {save_path}")
     if save_path.exists():
-        state = torch.load(save_path, map_location=device, weights_only=True)
+        state = torch.load(save_path, map_location="cpu", weights_only=True)
         if isinstance(model.unet, nn.DataParallel):
-            state = {
-                (k.replace("unet.", "unet.module.", 1) if k.startswith("unet.") else k): v
-                for k, v in state.items()
-            }
+            model.unet = model.unet.module
+        model.cpu()
         model.load_state_dict(state)
+        model.to(device)
     return model
 
 
@@ -1268,6 +1350,8 @@ def main() -> None:
                              "when more than one is available (default: on).")
     parser.add_argument("--single-gpu", dest="data_parallel", action="store_false",
                         help="Disable multi-GPU; train on cuda:0 only.")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Resume from an epoch checkpoint. --epochs remains the total target epoch count.")
 
     args = parser.parse_args()
     if args.max_datasets is not None and args.max_datasets < 1:
@@ -1281,11 +1365,16 @@ def main() -> None:
     unet_layers = [int(x) for x in args.unet_layers.split(",")]
     unet_weights = Path(args.unet_weights) if args.unet_weights else None
     debug_video = Path(args.debug_video) if args.debug_video else None
+    resume = Path(args.resume) if args.resume else None
     downsample = tuple(int(x) for x in args.downsample.split(","))
 
     folds = [0] if debug_video is not None else (
         range(5) if args.split == "all" else [int(args.split)]
     )
+    if resume is not None and args.split == "all":
+        parser.error("--resume requires a single --split; it cannot be used with --split all")
+    if resume is not None and unet_weights is not None:
+        parser.error("--resume and --unet-weights cannot be used together")
     for fold in folds:
         train(
             data_dir=data_dir,
@@ -1308,6 +1397,7 @@ def main() -> None:
             window_size=args.window_size,
             pool_kernel_um=args.pool_kernel_um,
             data_parallel=args.data_parallel,
+            resume=resume,
         )
 
 

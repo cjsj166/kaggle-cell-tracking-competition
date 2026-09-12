@@ -37,6 +37,63 @@ uv run python scripts/train_unet_transformer.py \
     --data-dir data/train --split 0 --epochs 3
 ```
 
+Training artifacts are stored as follows:
+
+```text
+weights/
+└── <method>/
+    └── split_<fold>/
+        ├── edge_predictor_best.pth       # Weights with the best competition score
+        └── checkpoints/
+            └── checkpoint_epoch_NNNN.pth  # Model, optimizer, epoch, and global step
+runs/
+└── <method>/
+    └── split_<fold>/
+        └── <run-id>/                    # TensorBoard event files
+```
+
+Each validation epoch records these values under the `validation/` TensorBoard
+namespace:
+
+| Metric | Description |
+| --- | --- |
+| `score` | Competition score used to select `edge_predictor_best.pth` |
+| `adj_edge_jaccard` | Edge Jaccard adjusted by the predicted node-count ratio |
+| `edge_jaccard` | Micro-averaged edge Jaccard |
+| `division_jaccard` | Micro-averaged division Jaccard |
+| `node_recall` | Mean matched-node recall across evaluated movies |
+| `total_node_ratio` | Signed relative difference between predicted and estimated node counts |
+| `edge_tp`, `edge_fp`, `edge_fn` | Aggregated edge counts |
+| `division_tp`, `division_fp`, `division_fn` | Aggregated division counts |
+| `num_pred_nodes`, `estimated_num_nodes` | Predicted and estimated node totals |
+| `loss`, `edge_loss`, `det_loss` | Combined, edge, and detection validation losses |
+| `edge_accuracy`, `detection_node_recall` | Window-level validation diagnostics |
+
+#### Resume training
+
+Pass an epoch checkpoint from the `checkpoints/` directory to `--resume`. Do
+not use `edge_predictor_best.pth`: it contains model weights only, whereas an
+epoch checkpoint also contains the optimizer, completed epoch, and global
+step. For example, resume split 0 after epoch 10 and continue until epoch 50:
+
+```bash
+uv run python scripts/train_unet_transformer.py \
+    --data-dir data/train --split 0 --epochs 50 \
+    --resume weights/unet_transformer/split_0/checkpoints/checkpoint_epoch_0010.pth
+```
+
+`--epochs` is the final target epoch, not the number of additional epochs. If
+the original run used non-default model options, pass the same options when
+resuming.
+
+#### TensorBoard
+
+Start TensorBoard so it is reachable from outside the current environment:
+
+```bash
+uv run tensorboard --logdir runs --host 0.0.0.0
+```
+
 This command trained the model released in the public [UNet baseline inference notebook](https://www.kaggle.com/code/thibautgoldsborough/unet-baseline-inference-submission). It was not trained to convergence — expect gains from training longer.
 
 ### Prediction
