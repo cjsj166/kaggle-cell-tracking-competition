@@ -37,23 +37,39 @@ uv run python scripts/train_unet_transformer.py \
     --data-dir data/train --split 0 --epochs 3
 ```
 
-Training losses are written to `runs/<method>/split_<fold>/<run-id>/` for
-TensorBoard. Every validation epoch also records edge, detection, and combined
-losses together with the full tracking score breakdown: adjusted and raw edge
-Jaccard, division Jaccard, node recall, TP/FP/FN counts, predicted/estimated
-node counts, and the signed node-count ratio. Validation shares each window's
-UNet output between loss and tracking metrics. Loss retains window-local
-detections; tracking keeps each frame's first detected coordinates and extracts
-features from the current window, using the same assembly code as prediction.
-Tracking uses the training detection/edge thresholds without TTA or additional
-parent/child limits. Only frames and transitions supplied by the validation
-loader are scored; its GT filtering and `max_frames` behavior are unchanged.
-For partial movies, whole-movie node estimates are not rescaled: node-count
-ratios and adjusted scores for those movies are NaN, while raw Jaccards remain
-available. A full training checkpoint is
-saved after every epoch under
-`weights/<method>/split_<fold>/checkpoints/`. Resume from one while keeping
-`--epochs` as the total target epoch count:
+Training artifacts are stored as follows:
+
+```text
+weights/
+└── <method>/
+    └── split_<fold>/
+        ├── edge_predictor_best.pth       # Weights with the best competition score
+        └── checkpoints/
+            └── checkpoint_epoch_NNNN.pth  # Model, optimizer, epoch, and global step
+runs/
+└── <method>/
+    └── split_<fold>/
+        └── <run-id>/                    # TensorBoard event files
+```
+
+Each validation epoch records these values under the `validation/` TensorBoard
+namespace:
+
+| Metric | Description |
+| --- | --- |
+| `score` | Competition score used to select `edge_predictor_best.pth` |
+| `adj_edge_jaccard` | Edge Jaccard adjusted by the predicted node-count ratio |
+| `edge_jaccard` | Micro-averaged edge Jaccard |
+| `division_jaccard` | Micro-averaged division Jaccard |
+| `node_recall` | Mean matched-node recall across evaluated movies |
+| `total_node_ratio` | Signed relative difference between predicted and estimated node counts |
+| `edge_tp`, `edge_fp`, `edge_fn` | Aggregated edge counts |
+| `division_tp`, `division_fp`, `division_fn` | Aggregated division counts |
+| `num_pred_nodes`, `estimated_num_nodes` | Predicted and estimated node totals |
+| `loss`, `edge_loss`, `det_loss` | Combined, edge, and detection validation losses |
+| `edge_accuracy`, `detection_node_recall` | Window-level validation diagnostics |
+
+To resume from epoch 10 and train until a total of 50 epochs:
 
 ```bash
 uv run python scripts/train_unet_transformer.py \
@@ -61,8 +77,10 @@ uv run python scripts/train_unet_transformer.py \
     --resume weights/unet_transformer/split_0/checkpoints/checkpoint_epoch_0010.pth
 ```
 
+Start TensorBoard so it is reachable from outside the current environment:
+
 ```bash
-uv run tensorboard --logdir runs
+uv run tensorboard --logdir runs --host 0.0.0.0
 ```
 
 This command trained the model released in the public [UNet baseline inference notebook](https://www.kaggle.com/code/thibautgoldsborough/unet-baseline-inference-submission). It was not trained to convergence — expect gains from training longer.
