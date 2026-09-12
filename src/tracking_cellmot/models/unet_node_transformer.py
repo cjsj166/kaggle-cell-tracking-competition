@@ -5,6 +5,9 @@ import torch
 import torch.nn as nn
 
 from tracking_cellmot.models.simple_node_transformer import SimpleNodeTransformer
+from tracking_cellmot.models.temporal_unet import TemporalUNet3D
+
+__all__ = ["POS_EMBED_DIM", "UNetNodeTransformer", "extract_pos_features"]
 
 POS_EMBED_DIM = 8
 
@@ -31,16 +34,21 @@ class UNetNodeTransformer(nn.Module):
 
     def __init__(
         self,
-        unet: nn.Module,
         unet_out_channels: int,
+        unet_layers: list[int],
         pos_feat_dim: int,
+        in_channels: int = 1,
         hidden_dim: int = 128,
         n_heads: int = 4,
         n_blocks: int = 4,
         dropout: float = 0.3,
     ):
         super().__init__()
-        self.unet = unet
+        self.unet = TemporalUNet3D(
+            in_channels=in_channels,
+            out_channels=unet_out_channels,
+            layers=unet_layers,
+        )
         self.unet_out_channels = unet_out_channels
         self.detect_head = nn.Conv3d(unet_out_channels, 1, kernel_size=1)
         self.transformer = SimpleNodeTransformer(

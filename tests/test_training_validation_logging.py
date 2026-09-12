@@ -36,7 +36,7 @@ class _ValidationModel:
 
 
 @pytest.mark.parametrize("valid_pairs", [0, 1, 2])
-def test_evaluate_returns_all_three_validation_losses(
+def test_run_validation_returns_all_three_validation_losses(
     monkeypatch: pytest.MonkeyPatch, valid_pairs: int,
 ) -> None:
     batch_size, window_size = 2, 2
@@ -70,7 +70,7 @@ def test_evaluate_returns_all_three_validation_losses(
     pair_results = iter([(3.0, 1, 2)] * valid_pairs + [(0.0, 0, 0)] * (batch_size - valid_pairs))
     monkeypatch.setattr(training, "_evaluate_pair", lambda *args: next(pair_results))
 
-    result = training.evaluate(
+    result = training.run_validation(
         _ValidationModel(), [batch], torch.device("cpu"), det_loss_weight=0.5, det_neg_weight=0.1,
         predictions={},
     )
@@ -116,7 +116,7 @@ def test_empty_pairs_do_not_dilute_real_validation_loss(
 
     monkeypatch.setattr(training, "detect_and_match", fake_detect_and_match)
     monkeypatch.setattr(training, "compute_detection_loss", lambda *args: torch.tensor(2.0))
-    result = training.evaluate(
+    result = training.run_validation(
         _ValidationModel(), [batch], torch.device("cpu"),
         det_loss_weight=0.5, det_neg_weight=0.1, predictions={},
     )
@@ -136,9 +136,9 @@ def test_resume_restores_cpu_model_and_optimizer_before_training(
     events = []
 
     class TinyModel(torch.nn.Module):
-        def __init__(self, unet, **kwargs):
+        def __init__(self, unet=None, **kwargs):
             super().__init__()
-            self.unet = unet
+            self.unet = unet if unet is not None else torch.nn.Linear(1, 1)
 
         def load_state_dict(self, state, **kwargs):
             assert not isinstance(self.unet, torch.nn.DataParallel)
@@ -166,7 +166,6 @@ def test_resume_restores_cpu_model_and_optimizer_before_training(
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(training, "WEIGHTS_PATH", tmp_path / "weights")
     monkeypatch.setattr(training, "RUNS_PATH", tmp_path / "runs")
-    monkeypatch.setattr(training, "TemporalUNet3D", lambda **kwargs: torch.nn.Linear(1, 1))
     monkeypatch.setattr(training, "UNetNodeTransformer", TinyModel)
     monkeypatch.setattr(training, "load_dataset_windows", lambda *args, **kwargs: (
         None, [SimpleNamespace(node_counts=[1, 1])],
@@ -187,10 +186,10 @@ def test_resume_restores_cpu_model_and_optimizer_before_training(
         return 1.0, 2.0, 8
 
     monkeypatch.setattr(training, "train_epoch", fake_train_epoch)
-    monkeypatch.setattr(training, "evaluate", lambda *args, **kwargs: (
+    monkeypatch.setattr(training, "run_validation", lambda *args, **kwargs: (
         training.ValidationLosses(1.0, 2.0, 3.0, 1.0, 1.0)
     ))
-    monkeypatch.setattr(training, "evaluate_tracking_metrics", lambda *args, **kwargs: dict.fromkeys(
+    monkeypatch.setattr(training, "score_tracking_predictions", lambda *args, **kwargs: dict.fromkeys(
         ["score", "edge_jaccard", "adj_edge_jaccard", "division_jaccard", "total_node_ratio"], 1.0,
     ))
 
@@ -231,7 +230,7 @@ def test_full_video_metrics_include_counts_and_node_ratio(
     monkeypatch.setattr(training, "_read_estimated_n_total", lambda path: next(estimate_iter))
 
     with pytest.warns(UserWarning, match="No divisions"):
-        result = training.evaluate_tracking_metrics(
+        result = training.score_tracking_predictions(
             {f"video_{i}": SimpleNamespace(
                 result=lambda: (coords, edges), seen_frames={0, 1}, seen_pairs={(0, 1)},
             ) for i in range(len(estimates))},

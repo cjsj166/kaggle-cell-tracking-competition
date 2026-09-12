@@ -41,7 +41,6 @@ from tracking_cellmot.metrics import (
 )
 from tracking_cellmot.models import (
     POS_EMBED_DIM,
-    TemporalUNet3D,
     UNetNodeTransformer,
     extract_pos_features,
 )
@@ -130,9 +129,6 @@ from dataspec import RUNS_PATH, WEIGHTS_PATH
 from evaluate import _read_estimated_n_total
 
 DEFAULT_METHOD = "unet_transformer"
-_POS_EMBED_DIM = POS_EMBED_DIM
-
-
 # =============================================================================
 # Data structures
 # =============================================================================
@@ -476,7 +472,7 @@ def compute_detection_loss(
 def _pos_embed_torch(
     coords: torch.Tensor,
     image_shape: tuple[int, ...],
-    pos_embed_dim: int = _POS_EMBED_DIM,
+    pos_embed_dim: int = POS_EMBED_DIM,
 ) -> torch.Tensor:
     """Batched sinusoidal positional embeddings (pure torch, stays on device).
 
@@ -533,7 +529,7 @@ def detect_and_match(
     Returns
     -------
     coords : (B, M, 3)  detected coordinates (downsampled).
-    pos    : (B, M, 4*_POS_EMBED_DIM)  positional embeddings.
+    pos    : (B, M, 4*POS_EMBED_DIM)  positional embeddings.
     mask   : (B, M)  bool.
     matches : list[Tensor]  per-sample match arrays.
     """
@@ -809,7 +805,7 @@ def train_epoch(
 
 
 @torch.no_grad()
-def evaluate(
+def run_validation(
     model: UNetNodeTransformer,
     loader: DataLoader,
     device: torch.device,
@@ -932,7 +928,7 @@ def evaluate(
 
 
 @torch.no_grad()
-def evaluate_tracking_metrics(
+def score_tracking_predictions(
     predictions: dict[str, VideoPredictionAccumulator],
 ) -> dict[str, float]:
     """Score collected graphs only on frames and transitions the loader visited.
@@ -1135,7 +1131,7 @@ def train(
     max_nodes = max(max(w.node_counts) for w in all_windows)
     print(f"max_nodes={max_nodes}")
 
-    pos_feat_dim = 4 * _POS_EMBED_DIM
+    pos_feat_dim = 4 * POS_EMBED_DIM
 
     train_ds = FrameWindowDataset(train_video_data, max_nodes=max_nodes, augmentations=augmentations)
     test_ds = FrameWindowDataset(test_video_data, max_nodes=max_nodes)
@@ -1166,21 +1162,15 @@ def train(
     n_visible = torch.cuda.device_count() if device.type == "cuda" else 0
     print(f"Using device: {device} | visible CUDA GPUs: {n_visible}")
 
-    unet = TemporalUNet3D(
-        in_channels=1,
-        out_channels=unet_out_channels,
-        layers=unet_layers,
+    model = UNetNodeTransformer(
+        unet_out_channels=unet_out_channels,
+        unet_layers=unet_layers,
+        pos_feat_dim=pos_feat_dim,
     )
     if unet_weights is not None:
         state = torch.load(unet_weights, map_location="cpu", weights_only=True)
-        missing, unexpected = unet.load_state_dict(state, strict=False)
+        missing, unexpected = model.unet.load_state_dict(state, strict=False)
         print(f"  UNet weights: {len(missing)} missing, {len(unexpected)} unexpected")
-
-    model = UNetNodeTransformer(
-        unet=unet,
-        unet_out_channels=unet_out_channels,
-        pos_feat_dim=pos_feat_dim,
-    )
 
     checkpoint = None
     if resume is not None:
@@ -1247,7 +1237,7 @@ def train(
 
             t0 = time.monotonic()
             validation_predictions = {}
-            validation_losses = evaluate(
+            validation_losses = run_validation(
                 model,
                 test_loader,
                 device,
@@ -1256,7 +1246,7 @@ def train(
                 pool_kernel_um=pool_kernel_um,
                 predictions=validation_predictions,
             )
-            validation_metrics = evaluate_tracking_metrics(validation_predictions)
+            validation_metrics = score_tracking_predictions(validation_predictions)
             validation_time = time.monotonic() - t0
 
             score = (

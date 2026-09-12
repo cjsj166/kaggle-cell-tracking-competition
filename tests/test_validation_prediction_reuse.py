@@ -32,7 +32,7 @@ class RecordingModel:
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])
-def test_evaluate_reuses_unet_and_preserves_loss_across_batches_and_movies(batch_size):
+def test_run_validation_reuses_unet_and_preserves_loss_across_batches_and_movies(batch_size):
     batches = []
     for video, start in [("a", 0), ("a", 1), ("b", 0)]:
         imgs = torch.full((1, 2, 1, 1, 3), -1.)
@@ -55,14 +55,16 @@ def test_evaluate_reuses_unet_and_preserves_loss_across_batches_and_movies(batch
         for offset in range(0, len(batches), batch_size)
         for group in [batches[offset:offset + batch_size]]
     ]
-    reference = training.evaluate(
+    reference = training.run_validation(
         RecordingModel(), batches, torch.device("cpu"), 0.1, 0.01,
         pool_kernel_um=1., predictions={},
     )
     model = RecordingModel()
     predictions = {}
-    actual = training.evaluate(model, batches, torch.device("cpu"), 0.1, 0.01,
-                               pool_kernel_um=1., predictions=predictions)
+    actual = training.run_validation(
+        model, batches, torch.device("cpu"), 0.1, 0.01,
+        pool_kernel_um=1., predictions=predictions,
+    )
     assert actual == reference
     assert model.encodes == len(batches)
     assert predictions["a"].seen_frames == {0, 1, 2}
@@ -84,7 +86,7 @@ def test_metrics_exclude_unvisited_frames_and_transitions(monkeypatch):
         pytest.fail("A whole-movie estimate cannot be used for partial coverage")
     monkeypatch.setattr(training, "_read_estimated_n_total", no_full_movie_estimate)
     with pytest.warns(UserWarning, match="No divisions"):
-        result = training.evaluate_tracking_metrics({"movie": SimpleNamespace(
+        result = training.score_tracking_predictions({"movie": SimpleNamespace(
             result=lambda: (selected, edges), seen_frames=set(range(5)),
             seen_pairs={(0, 1), (2, 3), (3, 4)},
         )})
@@ -96,12 +98,12 @@ def test_metrics_exclude_unvisited_frames_and_transitions(monkeypatch):
 
 def test_validation_requires_explicit_loss_weights():
     with pytest.raises(TypeError):
-        training.evaluate(RecordingModel(), [], torch.device("cpu"))
+        training.run_validation(RecordingModel(), [], torch.device("cpu"))
 
 
 def test_validation_requires_prediction_accumulator():
     with pytest.raises(TypeError):
-        training.evaluate(
+        training.run_validation(
             RecordingModel(), [], torch.device("cpu"), 0.1, 0.01,
         )
 
@@ -116,7 +118,7 @@ def test_empty_detections_keep_frame_coverage_and_gt_recall(monkeypatch):
         tracks=gt, image_shape=(3, 1, 1, 1), scale=(1., 1., 1.),
     ))
     with pytest.warns(UserWarning):
-        result = training.evaluate_tracking_metrics({"movie": acc})
+        result = training.score_tracking_predictions({"movie": acc})
     assert result["edge_fn"] == 1
     assert result["edge_tp"] == 0
     assert result["num_pred_nodes"] == 0

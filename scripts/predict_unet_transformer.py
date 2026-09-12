@@ -21,7 +21,6 @@ from tqdm import tqdm
 from tracking_cellmot.io import open_dataset, save_graph
 from tracking_cellmot.models import (
     POS_EMBED_DIM,
-    TemporalUNet3D,
     UNetNodeTransformer,
 )
 from tracking_cellmot.prediction import VideoPredictionAccumulator, build_graph
@@ -137,14 +136,9 @@ def load_model(
 
     downsample = tuple(config["downsample"])
 
-    unet = TemporalUNet3D(
-        in_channels=1,
-        out_channels=config["unet_out_channels"],
-        layers=config["unet_layers"],
-    )
     model = UNetNodeTransformer(
-        unet=unet,
         unet_out_channels=config["unet_out_channels"],
+        unet_layers=config["unet_layers"],
         pos_feat_dim=4 * POS_EMBED_DIM,
     )
     state = torch.load(weights_path, map_location=device, weights_only=True)
