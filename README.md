@@ -43,6 +43,7 @@ Training artifacts are stored as follows:
 weights/
 └── <method>/
     └── split_<fold>/
+        ├── config.json                   # Persisted TrainingConfig for this run
         ├── edge_predictor_best.pth       # Weights with the best competition score
         └── checkpoints/
             └── checkpoint_epoch_NNNN.pth  # Model, optimizer, epoch, and global step
@@ -111,10 +112,11 @@ error rather than silently leaving a gap in the curve. Results use the same
 are written as one TensorBoard run under `runs/<method>/split_<fold>/<run-id>/`.
 Use `--run-dir` to append the scalars to a specific run instead.
 
-Pass the same `--batch-size`, `--det-loss-weight`, and `--det-neg-weight` used
-for training when they differed from the defaults. Model architecture,
-downsampling, window size, and pooling distance are restored from the saved
-`config.json`.
+Post-hoc validation requires the split JSON used for training and reads its
+validation datasets without generating a new split. Model architecture,
+downsampling, window size, pooling distance, and loss settings are restored
+from the saved `config.json`; `--batch-size` and `--num-workers` remain runtime
+options.
 
 This command trained the model released in the public [UNet baseline inference notebook](https://www.kaggle.com/code/thibautgoldsborough/unet-baseline-inference-submission). It was not trained to convergence — expect gains from training longer.
 
