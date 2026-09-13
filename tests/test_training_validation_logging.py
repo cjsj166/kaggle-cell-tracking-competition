@@ -11,6 +11,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 import train_unet_transformer as training
+
 from tracking_cellmot.edge_prediction import build_graph
 
 
@@ -130,7 +131,7 @@ def test_empty_pairs_do_not_dilute_real_validation_loss(
 
 
 @pytest.mark.parametrize("wrap_unet", [False, True])
-def test_resume_restores_cpu_model_and_optimizer_before_training(
+def test_resume_restores_model_and_optimizer_before_training(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
     wrap_unet: bool,
 ) -> None:
@@ -174,7 +175,7 @@ def test_resume_restores_cpu_model_and_optimizer_before_training(
     monkeypatch.setattr(training, "FrameWindowDataset", lambda *args, **kwargs: [0])
 
     def fake_train_epoch(model, loader, restored_optimizer, *args, **kwargs):
-        assert events == ["load", "to"]
+        assert events == ["to", "load"]
         assert kwargs["global_step"] == 7
         for key, value in model.state_dict().items():
             torch.testing.assert_close(value, expected[key])
@@ -203,7 +204,7 @@ def test_resume_restores_cpu_model_and_optimizer_before_training(
         debug_video=tmp_path / "video", resume=resume, n_epochs=2, num_workers=0,
     )
 
-    assert events == ["load", "to", "load", "to"]
+    assert events == ["to", "load", "load", "to"]
     saved = torch.load(
         tmp_path / "weights/unet_transformer/split_0/checkpoints/checkpoint_epoch_0002.pth",
         map_location="cpu", weights_only=True,

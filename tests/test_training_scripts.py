@@ -7,16 +7,16 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
-import tracksdata as td
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
-from train_unet_transformer import train, DEFAULT_AUGMENTATIONS
 from predict_unet_transformer import PredictConfig, load_model, predict_video
+from train_unet_transformer import train
+
+from tracking_cellmot.edge_prediction import build_graph
 from tracking_cellmot.io import open_dataset
 from tracking_cellmot.metrics import evaluate, node_recall
-from tracking_cellmot.edge_prediction import build_graph
-
+from tracking_cellmot.training_config import TrainingConfig
 
 # 5-frame clip extracted from the full dataset: frames 26–30, division at t=2.
 _FIXTURE_DIR = Path(__file__).parent / "data" / "division_clip"
@@ -76,16 +76,18 @@ def test_unet_transformer_overfit_and_evaluate(
         batch_size=32,
         num_workers=8,
         max_iters=400,
-        unet_out_channels=_TEST_CONFIG["unet_out_channels"],
-        unet_layers=_TEST_CONFIG["unet_layers"],
-        downsample=tuple(_TEST_CONFIG["downsample"]),
-        det_loss_weight=1e0,
-        det_neg_weight=5e-2,
+        config=TrainingConfig(
+            unet_out_channels=_TEST_CONFIG["unet_out_channels"],
+            unet_layers=tuple(_TEST_CONFIG["unet_layers"]),
+            downsample=tuple(_TEST_CONFIG["downsample"]),
+            det_loss_weight=1e0,
+            det_neg_weight=5e-2,
+            window_size=window_size,
+            pool_kernel_um=_TEST_CONFIG["pool_kernel_um"],
+        ),
         debug_video=DS_PATH,
         seed=42,
-        window_size=window_size,
         augmentations=None,
-        pool_kernel_um=_TEST_CONFIG["pool_kernel_um"],
     )
 
     # Save weights + config so load_model can reconstruct the architecture.

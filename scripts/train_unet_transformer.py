@@ -17,6 +17,7 @@ import json
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import cycle as _cycle
 from pathlib import Path
 
 import numpy as np
@@ -24,29 +25,34 @@ import polars as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import tracksdata as td
 import zarr
+from augmentations import brightness_augment, flip_augment
+from dataspec import RUNS_PATH, WEIGHTS_PATH
+from evaluate import _read_estimated_n_total
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-import tracksdata as td
-
+from tracking_cellmot.checkpoints import load_training_checkpoint
+from tracking_cellmot.edge_prediction import VideoPredictionAccumulator, build_graph
 from tracking_cellmot.io import invert_time_graph, open_dataset
 from tracking_cellmot.metrics import (
     COUNT_COLUMNS,
-    evaluate as compute_tracking_metric,
     node_recall,
     per_sample_metrics,
     summarise,
+)
+from tracking_cellmot.metrics import (
+    evaluate as compute_tracking_metric,
 )
 from tracking_cellmot.models import (
     POS_EMBED_DIM,
     UNetNodeTransformer,
     extract_pos_features,
 )
-from tracking_cellmot.edge_prediction import VideoPredictionAccumulator, build_graph
-
-from itertools import cycle as _cycle
+from tracking_cellmot.splits import create_splits
+from tracking_cellmot.training_config import TrainingConfig, save_training_config
 
 
 def compute_gt_transition_matrix(
@@ -122,11 +128,7 @@ def _evaluate_pair(
 
     return loss, correct, total
 
-from augmentations import brightness_augment, flip_augment
-
 DEFAULT_AUGMENTATIONS = [brightness_augment, flip_augment]
-from dataspec import RUNS_PATH, WEIGHTS_PATH
-from evaluate import _read_estimated_n_total
 
 DEFAULT_METHOD = "unet_transformer"
 # =============================================================================
@@ -1035,19 +1037,13 @@ def train(
     lr: float = 1e-3,
     batch_size: int = 16,
     num_workers: int = 4,  # benchmark_preload.py: 4 workers, no pin_memory is optimal
-    unet_out_channels: int = 32,
-    unet_layers: list[int] | None = None,
+    config: TrainingConfig | None = None,
     unet_weights: Path | None = None,
-    downsample: tuple[int, ...] = (1, 4, 4),
-    det_loss_weight: float = 1e1,
-    det_neg_weight: float = 1e-2,
     max_iters: int | None = None,
     debug_video: Path | None = None,
     seed: int | None = None,
     max_frames: int | None = None,
-    window_size: int = 2,
     augmentations: list | None = DEFAULT_AUGMENTATIONS,
-    pool_kernel_um: float = 5.0,
     data_parallel: bool = True,
     resume: Path | None = None,
     max_datasets: int | None = None,
@@ -1057,34 +1053,21 @@ def train(
     If *debug_video* is set the splits file is ignored and that single dataset
     is used for both train and test (quick sanity-check / overfitting run).
     """
+    if config is None:
+        config = TrainingConfig()
     if max_datasets is not None and max_datasets < 1:
         raise ValueError("max_datasets must be positive")
-    if window_size < 2:
+    if config.window_size < 2:
         raise ValueError("window_size must be at least 2")
-
-    if unet_layers is None:
-        unet_layers = [32, 64, 128]
 
     if debug_video is not None:
         train_files = test_files = [debug_video]
         print(f"Debug mode: using single video {debug_video.name}")
     else:
-        if splits_file.exists():
-            folds = json.loads(splits_file.read_text())
-        else:
-            # No splits file: build a deterministic seed-0 split from the
-            # datasets in data_dir (90% train / 10% validation), matching the
-            # accompanying notebook. This makes --splits optional.
-            import random
-            stems = sorted(
-                p.name[:-5] for p in data_dir.glob("*.zarr")
-                if (data_dir / f"{p.name[:-5]}.geff").exists()
-            )
-            random.Random(0).shuffle(stems)
-            n_val = max(1, len(stems) // 10)
-            folds = [{"split": 0, "train": stems[n_val:], "test": stems[:n_val]}]
-            print(f"No splits file at {splits_file}; generated seed-0 split "
-                  f"({len(stems) - n_val} train / {n_val} val).")
+        if not splits_file.exists():
+            create_splits(data_dir, splits_file)
+            print(f"No splits file at {splits_file}; generated seed-0 split.")
+        folds = json.loads(splits_file.read_text())
         fold_data = folds[fold]
         train_files = [data_dir / name for name in fold_data["train"]]
         test_files = [data_dir / name for name in fold_data["test"]]
@@ -1097,15 +1080,7 @@ def train(
     output_dir = WEIGHTS_PATH / method / f"split_{fold}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save arch config so predict_unet_transformer can reconstruct the model.
-    model_config = {
-        "unet_out_channels": unet_out_channels,
-        "unet_layers": unet_layers,
-        "downsample": list(downsample),
-        "window_size": window_size,
-        "pool_kernel_um": pool_kernel_um,
-    }
-    (output_dir / "config.json").write_text(json.dumps(model_config, indent=2))
+    save_training_config(config, output_dir / "config.json")
 
     def _load(
         files: list[Path], desc: str,
@@ -1114,9 +1089,9 @@ def train(
         data: list[tuple[VideoMeta, list[FrameWindowData]]] = []
         for f in tqdm(files, desc=desc, disable=False):
             video_meta, windows = load_dataset_windows(
-                f, window_size=window_size,
+                f, window_size=config.window_size,
                 max_frames=max_frames,
-                downsample=downsample,
+                downsample=config.downsample,
             )
             data.append((video_meta, windows))
         n_windows = sum(len(w) for _, w in data)
@@ -1163,8 +1138,8 @@ def train(
     print(f"Using device: {device} | visible CUDA GPUs: {n_visible}")
 
     model = UNetNodeTransformer(
-        unet_out_channels=unet_out_channels,
-        unet_layers=unet_layers,
+        unet_out_channels=config.unet_out_channels,
+        unet_layers=config.unet_layers,
         pos_feat_dim=pos_feat_dim,
     )
     if unet_weights is not None:
@@ -1172,13 +1147,12 @@ def train(
         missing, unexpected = model.unet.load_state_dict(state, strict=False)
         print(f"  UNet weights: {len(missing)} missing, {len(unexpected)} unexpected")
 
-    checkpoint = None
-    if resume is not None:
-        checkpoint = torch.load(resume, map_location="cpu", weights_only=True)
-        if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
-            raise ValueError(f"Not a training checkpoint: {resume}")
-        model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    checkpoint_info = None
+    if resume is not None:
+        checkpoint_info = load_training_checkpoint(resume, model, optimizer)
 
     # Simple multi-GPU: split the heavy UNet pass across all visible GPUs.
     # Only the UNet is wrapped (it takes/returns plain batched tensors); the
@@ -1197,7 +1171,6 @@ def train(
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params:,}")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     start_epoch = 0
     global_step = 0
     best_score = 0.0
@@ -1206,15 +1179,14 @@ def train(
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     run_dir = RUNS_PATH / method / f"split_{fold}" / datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    if checkpoint is not None:
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        start_epoch = int(checkpoint["epoch"])
-        global_step = int(checkpoint.get("global_step", 0))
+    if checkpoint_info is not None:
+        start_epoch = checkpoint_info.epoch
+        global_step = checkpoint_info.global_step
         print(
             f"Resumed {resume}: completed_epochs={start_epoch}, "
             f"global_step={global_step}",
         )
-        del checkpoint
+        del checkpoint_info
 
     print(
         f"Starting training at epoch {start_epoch + 1} of {n_epochs} "
@@ -1223,14 +1195,23 @@ def train(
     writer = SummaryWriter(log_dir=str(run_dir))
     print(f"TensorBoard logs: {run_dir}")
     pbar = tqdm(range(start_epoch, n_epochs), desc="Training", disable=False)
-    print(f"Detection loss: weight={det_loss_weight}, neg_weight={det_neg_weight}")
+    print(
+        f"Detection loss: weight={config.det_loss_weight}, "
+        f"neg_weight={config.det_neg_weight}"
+    )
 
     try:
         for epoch in pbar:
             t0 = time.monotonic()
             edge_loss, det_loss, global_step = train_epoch(
-                model, train_loader, optimizer, device, det_loss_weight, det_neg_weight,
-                max_iters=max_iters, pool_kernel_um=pool_kernel_um,
+                model,
+                train_loader,
+                optimizer,
+                device,
+                config.det_loss_weight,
+                config.det_neg_weight,
+                max_iters=max_iters,
+                pool_kernel_um=config.pool_kernel_um,
                 writer=writer, global_step=global_step,
             )
             train_time = time.monotonic() - t0
@@ -1241,9 +1222,9 @@ def train(
                 model,
                 test_loader,
                 device,
-                det_loss_weight=det_loss_weight,
-                det_neg_weight=det_neg_weight,
-                pool_kernel_um=pool_kernel_um,
+                det_loss_weight=config.det_loss_weight,
+                det_neg_weight=config.det_neg_weight,
+                pool_kernel_um=config.pool_kernel_um,
                 predictions=validation_predictions,
             )
             validation_metrics = score_tracking_predictions(validation_predictions)
@@ -1305,6 +1286,7 @@ def train(
 
 
 def main() -> None:
+    defaults = TrainingConfig()
     parser = argparse.ArgumentParser(
         description="Train UNet + transformer edge predictor end-to-end.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1321,16 +1303,18 @@ def main() -> None:
                              "the same spatial shape for batch_size > 1.")
     parser.add_argument("--num-workers", type=int, default=8,
                         help="DataLoader worker processes for parallel frame loading (default: 4).")
-    parser.add_argument("--unet-out-channels", type=int, default=32)
-    parser.add_argument("--unet-layers", type=str, default="32,64,128",
+    parser.add_argument(
+        "--unet-out-channels", type=int, default=defaults.unet_out_channels
+    )
+    parser.add_argument("--unet-layers", type=str, default=",".join(map(str, defaults.unet_layers)),
                         help="Comma-separated UNet channel widths, shallow→deep.")
     parser.add_argument("--unet-weights", type=str, default=None,
                         help="Path to pretrained UNet weights; loaded with strict=False.")
-    parser.add_argument("--downsample", type=str, default="1,4,4",
+    parser.add_argument("--downsample", type=str, default=",".join(map(str, defaults.downsample)),
                         help="Comma-separated spatial downsample strides Z,Y,X (default: 1,4,4).")
-    parser.add_argument("--det-loss-weight", type=float, default=1e0,
-                        help="Weight for detection loss relative to edge loss (default: 1e1).")
-    parser.add_argument("--det-neg-weight", type=float, default=1e-2,
+    parser.add_argument("--det-loss-weight", type=float, default=defaults.det_loss_weight,
+                        help="Weight for detection loss relative to edge loss (default: 1.0).")
+    parser.add_argument("--det-neg-weight", type=float, default=defaults.det_neg_weight,
                         help="Per-voxel weight for non-GT (negative) voxels in detection loss (default: 1e-2).")
     parser.add_argument("--max-iters", type=int, default=None,
                         help="Smoke-test only: override optimizer steps per epoch, cycling the "
@@ -1341,9 +1325,9 @@ def main() -> None:
     parser.add_argument("--debug-video", type=str, default=None,
                         help="Path to a single dataset for quick debugging. "
                              "Ignores --fold and splits file; trains and evaluates on this video only.")
-    parser.add_argument("--window-size", type=int, default=2,
+    parser.add_argument("--window-size", type=int, default=defaults.window_size,
                         help="Number of consecutive frames per training window (default: 2).")
-    parser.add_argument("--pool-kernel-um", type=float, default=5.0,
+    parser.add_argument("--pool-kernel-um", type=float, default=defaults.pool_kernel_um,
                         help="Local-max suppression distance in microns (default: 5.0).")
     parser.add_argument("--data-parallel", dest="data_parallel", action="store_true", default=True,
                         help="Split the UNet across all visible GPUs via nn.DataParallel "
@@ -1362,11 +1346,18 @@ def main() -> None:
     from dataspec import DATASET_PATH
     data_dir = Path(args.data_dir) if args.data_dir else Path(DATASET_PATH)
     splits_file = Path(args.splits) if args.splits else data_dir / "dataset_splits.json"
-    unet_layers = [int(x) for x in args.unet_layers.split(",")]
     unet_weights = Path(args.unet_weights) if args.unet_weights else None
     debug_video = Path(args.debug_video) if args.debug_video else None
     resume = Path(args.resume) if args.resume else None
-    downsample = tuple(int(x) for x in args.downsample.split(","))
+    config = TrainingConfig(
+        unet_out_channels=args.unet_out_channels,
+        unet_layers=tuple(int(x) for x in args.unet_layers.split(",")),
+        downsample=tuple(int(x) for x in args.downsample.split(",")),
+        window_size=args.window_size,
+        det_loss_weight=args.det_loss_weight,
+        det_neg_weight=args.det_neg_weight,
+        pool_kernel_um=args.pool_kernel_um,
+    )
 
     folds = [0] if debug_video is not None else (
         range(5) if args.split == "all" else [int(args.split)]
@@ -1385,17 +1376,11 @@ def main() -> None:
             lr=args.lr,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
-            unet_out_channels=args.unet_out_channels,
-            unet_layers=unet_layers,
+            config=config,
             unet_weights=unet_weights,
-            downsample=downsample,
-            det_loss_weight=args.det_loss_weight,
-            det_neg_weight=args.det_neg_weight,
             max_iters=args.max_iters,
             max_datasets=args.max_datasets,
             debug_video=debug_video,
-            window_size=args.window_size,
-            pool_kernel_um=args.pool_kernel_um,
             data_parallel=args.data_parallel,
             resume=resume,
         )
